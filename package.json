@@ -1,0 +1,23 @@
+{
+  "name": "coreference-service",
+  "version": "1.0.0",
+  "description": "Python-based MCP service for coreference resolution",
+  "scripts": {
+  "start": "python server.py",
+    "dev": "python server.py",
+    "install": "pip install -r requirements.txt && python -m spacy download en_core_web_sm",
+    "test": "pytest tests/"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "keywords": [
+    "mcp",
+    "nlp",
+    "coreference",
+    "resolution",
+    "spacy",
+    "neuralcoref"
+  ],
+  "author": "",
+  "license": "ISC"
+}
