@@ -5,6 +5,7 @@ Resolves pronouns and references in conversation messages
 
 import os
 import logging
+from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,8 +14,9 @@ from dotenv import load_dotenv
 from src.middleware.validation import validate_mcp_request, validate_api_key
 from src.routes.resolve import router as resolve_router
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from service directory
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # Configure logging
 logging.basicConfig(
