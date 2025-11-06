@@ -478,6 +478,9 @@ class CoreferenceResolver:
         Simple fallback for common pronouns when coreferee fails
         Handles: it, them, they, that, this
         Looks for most recent NOUN entity in conversation
+        
+        CRITICAL: Does NOT replace 'that' when used as a relative pronoun
+        (e.g., "the man that lived" - here 'that' is NOT a pronoun reference)
         """
         import re
         
@@ -487,7 +490,8 @@ class CoreferenceResolver:
             'it': r'\bit\b',
             'them': r'\bthem\b',
             'they': r'\bthey\b',
-            'that': r'\bthat\b',
+            # REMOVED 'that' - too risky, often used as relative pronoun
+            # 'that': r'\bthat\b',
             'this': r'\bthis\b'
         }
         
