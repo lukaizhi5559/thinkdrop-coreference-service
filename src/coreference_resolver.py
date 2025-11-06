@@ -502,56 +502,71 @@ class CoreferenceResolver:
         if not pronouns_to_resolve:
             return message
         
+        # CRITICAL: Process current message first to identify nouns we should EXCLUDE
+        current_msg_doc = self.nlp(message)
+        current_msg_nouns = set()
+        for token in current_msg_doc:
+            if token.pos_ == 'NOUN':
+                current_msg_nouns.add(token.text.lower())
+        
         # Look for most recent noun entity in conversation history
         # Go backwards through history to find the most recent entity
+        # PRIORITY 1: Named entities (PERSON, ORG, PRODUCT, etc.)
+        named_entity_candidates = []
+        noun_candidates = []
+        
         for msg in reversed(conversation_history[-3:]):  # Last 3 messages
             content = msg['content']
             
             # Process with spaCy to find entities
             msg_doc = self.nlp(content)
             
-            # Look for ANIMAL, PRODUCT, ORG, or common nouns
-            candidates = []
-            
-            # First priority: Named entities
+            # First priority: Named entities (these are most likely referents)
             for ent in msg_doc.ents:
-                if ent.label_ in ['ANIMAL', 'PRODUCT', 'ORG', 'GPE', 'PERSON']:
-                    candidates.append(ent.text)
+                # Include all major entity types that could be pronoun referents
+                # Exclude DATE/TIME (too generic), PERCENT/MONEY/QUANTITY (numerical)
+                if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'LANGUAGE', 
+                                   'NORP', 'FAC', 'LOC', 'EVENT', 'LAW', 'PERCENT', 'MONEY',
+                                   'QUANTITY', 'ORDINAL', 'CARDINAL']:
+                    # Exclude if this entity appears in current message (likely not a referent)
+                    if ent.text.lower() not in current_msg_nouns:
+                        named_entity_candidates.append(ent.text)
             
-            # Second priority: Plural nouns (for "them/they")
-            if 'them' in pronouns_to_resolve or 'they' in pronouns_to_resolve:
-                for token in msg_doc:
-                    if token.pos_ == 'NOUN' and token.tag_ in ['NNS', 'NNPS']:  # Plural nouns
-                        # Get the full noun phrase
-                        noun_phrase = ' '.join([t.text for t in token.subtree])
-                        candidates.append(noun_phrase)
+            # Second priority: Proper nouns (NNP) that aren't in current message
+            for token in msg_doc:
+                if token.tag_ == 'NNP' and token.text.lower() not in current_msg_nouns:
+                    noun_phrase = ' '.join([t.text for t in token.subtree if t.pos_ in ['NOUN', 'PROPN', 'ADJ']])
+                    if noun_phrase and noun_phrase.lower() not in current_msg_nouns:
+                        noun_candidates.append(noun_phrase)
+        
+        # Use named entities first, then proper nouns
+        all_candidates = named_entity_candidates + noun_candidates
+        
+        if all_candidates:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_candidates = []
+            for c in all_candidates:
+                if c.lower() not in seen:
+                    seen.add(c.lower())
+                    unique_candidates.append(c)
             
-            # Third priority: Singular nouns (for "it/that/this")
-            if 'it' in pronouns_to_resolve or 'that' in pronouns_to_resolve or 'this' in pronouns_to_resolve:
-                for token in msg_doc:
-                    if token.pos_ == 'NOUN' and token.tag_ in ['NN', 'NNP']:  # Singular nouns
-                        # Get the full noun phrase
-                        noun_phrase = ' '.join([t.text for t in token.subtree])
-                        candidates.append(noun_phrase)
+            referent = unique_candidates[0]
+            logger.info(f"🎯 Simple fallback found referent: '{referent}' for pronouns: {pronouns_to_resolve}")
             
-            # Use the first (most prominent) candidate
-            if candidates:
-                referent = candidates[0]
-                logger.info(f"🎯 Simple fallback found referent: '{referent}' for pronouns: {pronouns_to_resolve}")
-                
-                # Replace pronouns with referent
-                resolved = message
-                for pronoun in pronouns_to_resolve:
-                    # Case-insensitive replacement
-                    resolved = re.sub(
-                        r'\b' + pronoun + r'\b',
-                        referent,
-                        resolved,
-                        count=1,
-                        flags=re.IGNORECASE
-                    )
-                
-                return resolved
+            # Replace pronouns with referent
+            resolved = message
+            for pronoun in pronouns_to_resolve:
+                # Case-insensitive replacement
+                resolved = re.sub(
+                    r'\b' + pronoun + r'\b',
+                    referent,
+                    resolved,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+            
+            return resolved
         
         # No referent found
         logger.debug("⚠️ Simple fallback: No referent found")
