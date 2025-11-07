@@ -39,3 +39,7 @@ models/
 # Logs
 *.log
 logs/
+
+# node and yarn
+.yarn
+node_modules
