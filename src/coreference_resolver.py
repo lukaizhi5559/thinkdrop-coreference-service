@@ -74,13 +74,30 @@ class CoreferenceResolver:
         options = options or {}
         
         try:
-            # Build full context document
+            # Build full context document and track message boundaries
             context_parts = []
+            message_roles = []  # Track whether each part is from user or assistant
             for msg in conversation_history[-5:]:  # Last 5 messages for context
                 context_parts.append(msg['content'])
+                message_roles.append(msg.get('role', 'user'))  # Default to user if role not specified
             context_parts.append(message)
+            message_roles.append('user')  # Current message is always from user
             
             full_text = " ".join(context_parts)
+            
+            # Store message boundaries and roles for later use
+            self._message_boundaries = []
+            current_pos = 0
+            for i, part in enumerate(context_parts):
+                start_pos = current_pos
+                end_pos = start_pos + len(part)
+                self._message_boundaries.append({
+                    'start': start_pos,
+                    'end': end_pos,
+                    'role': message_roles[i],
+                    'text': part
+                })
+                current_pos = end_pos + 1  # +1 for the space separator
             
             # Process with spaCy
             doc = self.nlp(full_text)
@@ -182,9 +199,48 @@ class CoreferenceResolver:
                         if in_current_message and is_pronoun:
                             # Pronoun in current message - mark for replacement
                             current_message_pronouns.append(mention_tokens[0].text)
+                        elif in_current_message and not is_pronoun:
+                            # CRITICAL: Entity in current message (same sentence as pronoun)
+                            # This should have HIGHEST priority - use position 10000000 to ensure it wins
+                            if any(t.ent_type_ in ['PERSON', 'ORG', 'PRODUCT', 'GPE'] for t in mention_tokens):
+                                entity_tokens = [t for t in mention_tokens if t.ent_type_ != '']
+                                if entity_tokens:
+                                    first_ent_token = entity_tokens[0]
+                                    ent_start = first_ent_token.i
+                                    ent_end = first_ent_token.i + 1
+                                    
+                                    while ent_start > 0 and doc[ent_start - 1].ent_type_ == first_ent_token.ent_type_:
+                                        ent_start -= 1
+                                    while ent_end < len(doc) and doc[ent_end].ent_type_ == first_ent_token.ent_type_:
+                                        ent_end += 1
+                                    
+                                    candidate_text = ' '.join([doc[i].text for i in range(ent_start, ent_end)])
+                                else:
+                                    candidate_text = mention_text
+                                
+                                # Use very high position to prioritize current message entities
+                                non_pronoun_candidates.append((candidate_text, 10000000, True))
+                                main_mention_text = candidate_text
+                                main_mention_pos = 10000000
+                                logger.info(f"🎯 Prioritizing entity from current message: '{candidate_text}'")
+                            elif any(t.pos_ == 'PROPN' for t in mention_tokens):
+                                non_pronoun_candidates.append((mention_text, 10000000, True))
+                                main_mention_text = mention_text
+                                main_mention_pos = 10000000
+                                logger.info(f"🎯 Prioritizing proper noun from current message: '{mention_text}'")
                         elif not in_current_message and not is_pronoun:
                             # Non-pronoun mention from earlier in conversation
-                            # Keep updating to get the MOST RECENT one (closest to current message)
+                            # CRITICAL: Prioritize entities from USER messages over ASSISTANT messages
+                            # This prevents picking entities the AI mentioned over entities the user explicitly referenced
+                            
+                            # Determine if this mention is from a user or assistant message
+                            is_from_user = False
+                            if hasattr(self, '_message_boundaries'):
+                                for boundary in self._message_boundaries:
+                                    if boundary['start'] <= token_pos < boundary['end']:
+                                        is_from_user = (boundary['role'] == 'user')
+                                        break
+                            
                             # Prefer PERSON/ORG entities
                             if any(t.ent_type_ in ['PERSON', 'ORG', 'PRODUCT', 'GPE'] for t in mention_tokens):
                                 # Get the FULL entity text by finding the complete entity span
@@ -209,29 +265,38 @@ class CoreferenceResolver:
                                     candidate_text = ' '.join([doc[i].text for i in range(ent_start, ent_end)])
                                 else:
                                     candidate_text = mention_text
-                                non_pronoun_candidates.append((candidate_text, token_pos))
-                                # Update if this is more recent (higher position)
-                                if token_pos > main_mention_pos:
+                                
+                                # Prioritize user messages: add 1000000 to position if from user
+                                # This ensures user entities always win over assistant entities
+                                priority_pos = token_pos + (1000000 if is_from_user else 0)
+                                non_pronoun_candidates.append((candidate_text, priority_pos, is_from_user))
+                                
+                                # Update if this has higher priority
+                                if priority_pos > main_mention_pos:
                                     main_mention_text = candidate_text
-                                    main_mention_pos = token_pos
+                                    main_mention_pos = priority_pos
+                                    logger.debug(f"📌 Candidate: '{candidate_text}' (pos: {token_pos}, user: {is_from_user}, priority: {priority_pos})")
                             elif any(t.pos_ == 'PROPN' for t in mention_tokens):
                                 # Proper noun phrase - use the full mention text
-                                non_pronoun_candidates.append((mention_text, token_pos))
-                                # Update if this is more recent (higher position)
-                                if token_pos > main_mention_pos:
+                                priority_pos = token_pos + (1000000 if is_from_user else 0)
+                                non_pronoun_candidates.append((mention_text, priority_pos, is_from_user))
+                                
+                                # Update if this has higher priority
+                                if priority_pos > main_mention_pos:
                                     main_mention_text = mention_text
-                                    main_mention_pos = token_pos
+                                    main_mention_pos = priority_pos
+                                    logger.debug(f"📌 Candidate: '{mention_text}' (pos: {token_pos}, user: {is_from_user}, priority: {priority_pos})")
                     
                     # Safety check: Only resolve if we have clear reference
-                    # UPDATED: Instead of skipping ambiguous chains, use the MOST RECENT mention
-                    # This handles conversations where multiple people are discussed
-                    unique_candidates = set(text for text, _ in non_pronoun_candidates)
+                    # UPDATED: Instead of skipping ambiguous chains, use the HIGHEST PRIORITY mention
+                    # Priority: current message (10000000) > user messages (1000000+pos) > assistant messages (pos)
+                    unique_candidates = set(text for text, *_ in non_pronoun_candidates)
                     
                     if len(unique_candidates) > 1:
-                        # Multiple entities in chain - use the most recent one (highest position)
-                        # This is already stored in main_mention_text due to our position-based update logic
+                        # Multiple entities in chain - use the highest priority one
+                        # This is already stored in main_mention_text due to our priority-based update logic
                         logger.debug(f"⚠️ Multiple entities in chain: {unique_candidates}")
-                        logger.debug(f"✅ Using most recent mention: '{main_mention_text}' (position: {main_mention_pos})")
+                        logger.info(f"✅ Using highest priority mention: '{main_mention_text}' (priority: {main_mention_pos})")
                     
                     # Replace pronouns in current message with main reference
                     if main_mention_text and current_message_pronouns:
@@ -477,7 +542,9 @@ class CoreferenceResolver:
         """
         Simple fallback for common pronouns when coreferee fails
         Handles: it, them, they, that, this
-        Looks for most recent NOUN entity in conversation
+        
+        CRITICAL: Special handling for "this" - if it appears right after an AI response,
+        it likely refers to the AI's response content, not entities mentioned earlier.
         
         CRITICAL: Does NOT replace 'that' when used as a relative pronoun
         (e.g., "the man that lived" - here 'that' is NOT a pronoun reference)
@@ -502,6 +569,28 @@ class CoreferenceResolver:
         if not pronouns_to_resolve:
             return message
         
+        # CRITICAL: Special case for "this" - check if it appears right after AI response
+        if 'this' in pronouns_to_resolve and conversation_history:
+            last_message = conversation_history[-1]
+            # If last message was from assistant and current message mentions "this"
+            if last_message.get('role') == 'assistant':
+                # Check if this is a request to transform/translate the AI's response
+                transform_patterns = [
+                    r'\b(give me|translate|convert|make|turn|put|write|show me)\s.*\bthis\b',
+                    r'\bthis\s+in\s+(chinese|spanish|french|english|japanese)',
+                    r'\b(summarize|explain|rewrite)\s.*\bthis\b'
+                ]
+                
+                is_transform_request = any(re.search(pattern, message, re.IGNORECASE) for pattern in transform_patterns)
+                
+                if is_transform_request:
+                    logger.info(f"🎯 Detected transform request for AI response: '{message}'")
+                    # Return a special marker that the calling code can recognize
+                    # This tells the system that "this" refers to the previous AI response
+                    resolved = re.sub(r'\bthis\b', 'the previous response', message, flags=re.IGNORECASE)
+                    logger.info(f"🔄 Resolved 'this' to refer to previous AI response: '{resolved}'")
+                    return resolved
+        
         # CRITICAL: Process current message first to identify nouns we should EXCLUDE
         current_msg_doc = self.nlp(message)
         current_msg_nouns = set()
@@ -515,6 +604,13 @@ class CoreferenceResolver:
         named_entity_candidates = []
         noun_candidates = []
         
+        # UI/Button text patterns to exclude (these are not meaningful referents)
+        ui_button_patterns = [
+            'log in', 'sign up', 'log out', 'sign in', 'click here', 'learn more',
+            'get started', 'try free', 'start trial', 'buy now', 'add to cart',
+            'search', 'submit', 'cancel', 'ok', 'yes', 'no', 'close', 'open'
+        ]
+        
         for msg in reversed(conversation_history[-3:]):  # Last 3 messages
             content = msg['content']
             
@@ -522,20 +618,68 @@ class CoreferenceResolver:
             msg_doc = self.nlp(content)
             
             # First priority: Named entities (these are most likely referents)
-            for ent in msg_doc.ents:
+            # CRITICAL: Merge adjacent entities that form compound references (e.g., "Genesis 6")
+            entities = list(msg_doc.ents)
+            merged_entities = []
+            i = 0
+            while i < len(entities):
+                current_ent = entities[i]
+                
+                # Check if next entity is a number that should be merged (e.g., "Genesis" + "6")
+                if i + 1 < len(entities):
+                    next_ent = entities[i + 1]
+                    # Merge if: current is PROPN/WORK_OF_ART and next is CARDINAL/MONEY/ORDINAL
+                    # AND they're adjacent (no words between them)
+                    if (current_ent.label_ in ['WORK_OF_ART', 'PERSON', 'ORG', 'GPE'] or 
+                        any(t.pos_ == 'PROPN' for t in current_ent)) and \
+                       next_ent.label_ in ['CARDINAL', 'MONEY', 'ORDINAL', 'QUANTITY'] and \
+                       next_ent.start == current_ent.end:
+                        # Merge them
+                        merged_text = f"{current_ent.text} {next_ent.text}"
+                        logger.info(f"🔗 Merging entities: '{current_ent.text}' + '{next_ent.text}' → '{merged_text}'")
+                        merged_entities.append((merged_text, 'MERGED'))
+                        i += 2  # Skip both entities
+                        continue
+                
+                merged_entities.append((current_ent.text, current_ent.label_))
+                i += 1
+            
+            for ent_text, ent_label in merged_entities:
                 # Include all major entity types that could be pronoun referents
-                # Exclude DATE/TIME (too generic), PERCENT/MONEY/QUANTITY (numerical)
-                if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'LANGUAGE', 
-                                   'NORP', 'FAC', 'LOC', 'EVENT', 'LAW', 'PERCENT', 'MONEY',
-                                   'QUANTITY', 'ORDINAL', 'CARDINAL']:
+                if ent_label in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'LANGUAGE', 
+                                 'NORP', 'FAC', 'LOC', 'EVENT', 'LAW', 'MERGED']:
                     # Exclude if this entity appears in current message (likely not a referent)
-                    if ent.text.lower() not in current_msg_nouns:
-                        named_entity_candidates.append(ent.text)
+                    if ent_text.lower() not in current_msg_nouns:
+                        # CRITICAL: Skip UI button text (e.g., "Log In/Sign Up")
+                        is_ui_button = any(pattern in ent_text.lower() for pattern in ui_button_patterns)
+                        if is_ui_button:
+                            logger.debug(f"⏭️ Skipping UI button text: '{ent_text}'")
+                            continue
+                        
+                        # CRITICAL FIX: Clean verbs from entity text
+                        # If entity is "open Slack", extract only "Slack"
+                        if ent_label != 'MERGED':  # Don't re-parse merged entities
+                            ent_doc = self.nlp(ent_text)
+                            entity_tokens = [t for t in ent_doc if t.pos_ in ['NOUN', 'PROPN', 'ADJ', 'NUM']]
+                            if entity_tokens:
+                                cleaned_entity = ' '.join([t.text for t in entity_tokens])
+                                # Double-check cleaned entity isn't UI text
+                                if not any(pattern in cleaned_entity.lower() for pattern in ui_button_patterns):
+                                    named_entity_candidates.append(cleaned_entity)
+                            else:
+                                # Fallback to original if no noun/propn/adj found
+                                if not is_ui_button:
+                                    named_entity_candidates.append(ent_text)
+                        else:
+                            # Merged entities are already clean
+                            named_entity_candidates.append(ent_text)
             
             # Second priority: Proper nouns (NNP) that aren't in current message
             for token in msg_doc:
                 if token.tag_ == 'NNP' and token.text.lower() not in current_msg_nouns:
-                    noun_phrase = ' '.join([t.text for t in token.subtree if t.pos_ in ['NOUN', 'PROPN', 'ADJ']])
+                    # CRITICAL FIX: Only extract noun/proper noun tokens, NOT verbs
+                    # This prevents capturing "open Slack" instead of just "Slack"
+                    noun_phrase = ' '.join([t.text for t in token.subtree if t.pos_ in ['NOUN', 'PROPN', 'ADJ'] and t.dep_ not in ['aux', 'auxpass', 'cop']])
                     if noun_phrase and noun_phrase.lower() not in current_msg_nouns:
                         noun_candidates.append(noun_phrase)
         
@@ -551,7 +695,60 @@ class CoreferenceResolver:
                     seen.add(c.lower())
                     unique_candidates.append(c)
             
-            referent = unique_candidates[0]
+            # CRITICAL: For screen-related questions, prioritize content entities over UI elements
+            # E.g., "what chapter is this on" should refer to "Genesis 6" not "Log In/Sign Up"
+            screen_question_keywords = ['chapter', 'page', 'section', 'article', 'reading', 'viewing', 'watching']
+            is_screen_question = any(keyword in message.lower() for keyword in screen_question_keywords)
+            
+            if is_screen_question and len(unique_candidates) > 1:
+                # Prioritize candidates that look like content (not UI buttons)
+                content_candidates = []
+                for candidate in unique_candidates:
+                    # Check if this looks like content (has numbers, or is a proper noun phrase)
+                    has_number = any(char.isdigit() for char in candidate)
+                    is_multi_word = len(candidate.split()) > 1
+                    is_ui_like = any(pattern in candidate.lower() for pattern in ui_button_patterns)
+                    
+                    if (has_number or is_multi_word) and not is_ui_like:
+                        content_candidates.append(candidate)
+                        logger.info(f"📄 Prioritizing content candidate: '{candidate}' for screen question")
+                
+                # Use content candidates if found, otherwise fall back to all candidates
+                if content_candidates:
+                    referent = content_candidates[0]
+                    logger.info(f"🎯 Selected content referent: '{referent}' for screen question")
+                else:
+                    referent = unique_candidates[0]
+            else:
+                referent = unique_candidates[0]
+            
+            # CRITICAL FIX: Strip verb prefixes from referent
+            # If referent is "open Slack", we want just "Slack"
+            # Parse the referent to remove any leading verbs
+            referent_doc = self.nlp(referent)
+            
+            # Common command verbs to strip
+            command_verbs = {'open', 'close', 'start', 'stop', 'launch', 'quit', 'kill', 'run', 'execute'}
+            
+            noun_tokens = []
+            for token in referent_doc:
+                # Skip if it's a verb OR if it's in our command verb list
+                if token.pos_ == 'VERB' or token.lemma_.lower() in command_verbs:
+                    logger.info(f"🚫 Skipping verb/command: '{token.text}' (pos: {token.pos_}, lemma: {token.lemma_})")
+                    continue
+                # Keep nouns, proper nouns, and adjectives
+                if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
+                    noun_tokens.append(token.text)
+            
+            # If we found noun tokens, use them; otherwise keep original
+            if noun_tokens:
+                cleaned_referent = ' '.join(noun_tokens)
+                if cleaned_referent != referent:
+                    logger.info(f"🧹 Cleaned referent: '{referent}' → '{cleaned_referent}'")
+                    referent = cleaned_referent
+            else:
+                logger.warning(f"⚠️ No noun tokens found in referent '{referent}', keeping original")
+            
             logger.info(f"🎯 Simple fallback found referent: '{referent}' for pronouns: {pronouns_to_resolve}")
             
             # Replace pronouns with referent
