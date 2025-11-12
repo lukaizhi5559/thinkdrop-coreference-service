@@ -595,14 +595,14 @@ class CoreferenceResolver:
         current_msg_doc = self.nlp(message)
         current_msg_nouns = set()
         for token in current_msg_doc:
-            if token.pos_ == 'NOUN':
+            if token.pos_ in ['NOUN', 'PROPN']:
                 current_msg_nouns.add(token.text.lower())
         
-        # Look for most recent noun entity in conversation history
-        # Go backwards through history to find the most recent entity
-        # PRIORITY 1: Named entities (PERSON, ORG, PRODUCT, etc.)
+        # Collect named entity candidates from conversation history
         named_entity_candidates = []
         noun_candidates = []
+        # Track which candidates came from highlighted text (don't re-process these)
+        highlighted_text_candidates = set()
         
         # UI/Button text patterns to exclude (these are not meaningful referents)
         ui_button_patterns = [
@@ -614,12 +614,65 @@ class CoreferenceResolver:
         for msg in reversed(conversation_history[-3:]):  # Last 3 messages
             content = msg['content']
             
+            # CRITICAL FIX: If this is a wrapped highlighted text message, extract the actual content
+            # E.g., "The highlighted text is: Arfrix Dela Cruz" → "Arfrix Dela Cruz"
+            # E.g., "The highlighted text is: I love Chick Filet" → "Chick Filet"
+            if content.startswith("The highlighted text is:"):
+                actual_content = content.split(":", 1)[1].strip()
+                logger.info(f"📎 Extracted highlighted content: '{actual_content}' from wrapped message")
+                
+                # Process the highlighted content with spaCy to extract entities
+                highlighted_doc = self.nlp(actual_content)
+                
+                # PRIORITY 1: Extract all consecutive proper nouns (PROPN) - most reliable for names
+                propn_sequence = []
+                for token in highlighted_doc:
+                    if token.pos_ == 'PROPN':
+                        propn_sequence.append(token.text)
+                    elif propn_sequence:
+                        # We hit a non-PROPN after collecting some PROPNs, stop here
+                        break
+                
+                if propn_sequence:
+                    entity = ' '.join(propn_sequence)
+                    named_entity_candidates.append(entity)
+                    highlighted_text_candidates.add(entity.lower())  # Mark as from highlighted text
+                    logger.info(f"✅ Extracted proper noun sequence from highlighted text: '{entity}'")
+                    continue
+                
+                # PRIORITY 2: Try named entity recognition (fallback for when PROPN fails)
+                highlighted_entities = [ent.text for ent in highlighted_doc.ents 
+                                       if ent.label_ in ['PERSON', 'ORG', 'PRODUCT', 'GPE', 'WORK_OF_ART', 'FAC', 'LOC']]
+                
+                if highlighted_entities:
+                    # Use the first entity found
+                    entity = highlighted_entities[0]
+                    named_entity_candidates.append(entity)
+                    logger.info(f"✅ Extracted NER entity from highlighted text: '{entity}'")
+                    continue
+                
+                # Last resort: If it's a short phrase (≤4 words) with no verbs, use it as-is
+                has_verb = any(token.pos_ == 'VERB' for token in highlighted_doc)
+                word_count = len(actual_content.split())
+                if not has_verb and word_count <= 4:
+                    named_entity_candidates.append(actual_content)
+                    logger.info(f"✅ Using short highlighted text as entity: '{actual_content}'")
+                    continue
+                
+                logger.warning(f"⚠️ Could not extract entity from highlighted text: '{actual_content}'")
+            
             # Process with spaCy to find entities
             msg_doc = self.nlp(content)
             
             # First priority: Named entities (these are most likely referents)
             # CRITICAL: Merge adjacent entities that form compound references (e.g., "Genesis 6")
             entities = list(msg_doc.ents)
+            
+            # DEBUG: Log what spaCy detected
+            logger.info(f"🔍 spaCy detected {len(entities)} entities in: '{msg['content']}'")
+            for ent in entities:
+                logger.info(f"   - Entity: '{ent.text}' (label: {ent.label_}, start: {ent.start}, end: {ent.end})")
+            
             merged_entities = []
             i = 0
             while i < len(entities):
@@ -658,7 +711,12 @@ class CoreferenceResolver:
                         
                         # CRITICAL FIX: Clean verbs from entity text
                         # If entity is "open Slack", extract only "Slack"
-                        if ent_label != 'MERGED':  # Don't re-parse merged entities
+                        # BUT: Keep PERSON entities intact to preserve full names
+                        if ent_label == 'PERSON':
+                            # Keep full person names as-is (e.g., "Arfrix Dela Cruz")
+                            named_entity_candidates.append(ent_text)
+                            logger.debug(f"👤 Keeping full PERSON entity: '{ent_text}'")
+                        elif ent_label != 'MERGED':  # Don't re-parse merged entities
                             ent_doc = self.nlp(ent_text)
                             entity_tokens = [t for t in ent_doc if t.pos_ in ['NOUN', 'PROPN', 'ADJ', 'NUM']]
                             if entity_tokens:
@@ -722,32 +780,57 @@ class CoreferenceResolver:
             else:
                 referent = unique_candidates[0]
             
-            # CRITICAL FIX: Strip verb prefixes from referent
-            # If referent is "open Slack", we want just "Slack"
-            # Parse the referent to remove any leading verbs
-            referent_doc = self.nlp(referent)
-            
-            # Common command verbs to strip
-            command_verbs = {'open', 'close', 'start', 'stop', 'launch', 'quit', 'kill', 'run', 'execute'}
-            
-            noun_tokens = []
-            for token in referent_doc:
-                # Skip if it's a verb OR if it's in our command verb list
-                if token.pos_ == 'VERB' or token.lemma_.lower() in command_verbs:
-                    logger.info(f"🚫 Skipping verb/command: '{token.text}' (pos: {token.pos_}, lemma: {token.lemma_})")
-                    continue
-                # Keep nouns, proper nouns, and adjectives
-                if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
-                    noun_tokens.append(token.text)
-            
-            # If we found noun tokens, use them; otherwise keep original
-            if noun_tokens:
-                cleaned_referent = ' '.join(noun_tokens)
-                if cleaned_referent != referent:
-                    logger.info(f"🧹 Cleaned referent: '{referent}' → '{cleaned_referent}'")
-                    referent = cleaned_referent
+            # CRITICAL FIX: Skip re-processing if this came from highlighted text
+            # Highlighted text has already been properly extracted (e.g., "Arfrix Dela Cruz")
+            if referent.lower() not in highlighted_text_candidates:
+                # CRITICAL FIX: Strip verb prefixes from referent
+                # If referent is "open Slack", we want just "Slack"
+                # BUT: Preserve full entity names (PERSON, ORG, PRODUCT, GPE, etc.)
+                referent_doc = self.nlp(referent)
+                
+                # Check if this contains a named entity - if so, extract ONLY the entity
+                # Priority order: PERSON > ORG > PRODUCT > GPE > WORK_OF_ART > others
+                entity_priority = ['PERSON', 'ORG', 'PRODUCT', 'GPE', 'WORK_OF_ART', 'FAC', 'LOC', 'EVENT', 'NORP']
+                extracted_entity = None
+                
+                for entity_type in entity_priority:
+                    entities = [ent for ent in referent_doc.ents if ent.label_ == entity_type]
+                    if entities:
+                        extracted_entity = entities[0].text
+                        logger.info(f"🏷️ Extracted {entity_type} entity from text: '{extracted_entity}'")
+                        break
+                
+                if extracted_entity:
+                    # E.g., "I love eating at Chick Filet" → "Chick Filet"
+                    # E.g., "doing very well Mark Shultz in life" → "Mark Shultz"
+                    referent = extracted_entity
+                else:
+                    # Common command verbs to strip
+                    command_verbs = {'open', 'close', 'start', 'stop', 'launch', 'quit', 'kill', 'run', 'execute'}
+                    
+                    noun_tokens = []
+                    for token in referent_doc:
+                        # Skip if it's a verb OR if it's in our command verb list
+                        if token.pos_ == 'VERB' or token.lemma_.lower() in command_verbs:
+                            logger.info(f"🚫 Skipping verb/command: '{token.text}' (pos: {token.pos_}, lemma: {token.lemma_})")
+                            continue
+                        # Keep nouns, proper nouns, and adjectives
+                        if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
+                            noun_tokens.append(token.text)
+                    
+                    # If we found noun tokens, use them; otherwise keep original
+                    if noun_tokens:
+                        cleaned_referent = ' '.join(noun_tokens)
+                        if cleaned_referent != referent:
+                            logger.info(f"🧹 Cleaned referent: '{referent}' → '{cleaned_referent}'")
+                            referent = cleaned_referent
+                    else:
+                        logger.warning(f"⚠️ No noun tokens found in referent '{referent}', keeping original")
+                    
+                    # DEBUG: Log what tokens were extracted
+                    logger.info(f"🔍 Extracted noun tokens: {noun_tokens}")
             else:
-                logger.warning(f"⚠️ No noun tokens found in referent '{referent}', keeping original")
+                logger.info(f"✅ Skipping re-processing for highlighted text candidate: '{referent}'")
             
             logger.info(f"🎯 Simple fallback found referent: '{referent}' for pronouns: {pronouns_to_resolve}")
             
