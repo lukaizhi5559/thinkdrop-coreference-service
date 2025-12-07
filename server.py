@@ -55,6 +55,15 @@ async def health_check():
 # Include routers
 app.include_router(resolve_router)
 
+# Startup event to pre-load models
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load spaCy model on startup for instant responses"""
+    logger.info("🔥 Warming up coreference resolver...")
+    from src.routes.resolve import get_resolver
+    resolver = get_resolver()  # This will initialize the model
+    logger.info("✅ Coreference resolver ready")
+
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
