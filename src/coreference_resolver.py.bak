@@ -625,6 +625,532 @@ class CoreferenceResolver:
         # 4. No resolution found - return original message
         logger.debug("⏭️ No context-aware resolution found, returning original message")
         return message
+        
+        # FAST GATE: Skip if no pronouns/demonstratives AND no elliptical patterns
+        has_pronouns = any(word in message.lower() for word in [
+            ' it ', ' them ', ' they ', ' this ', ' that ',
+            ' he ', ' she ', ' his ', ' her ', ' him ', ' their '
+        ])
+        
+        # SPECIAL CASE: Short answer to AI question
+        # If the message is very short (1-3 words) and the previous message is from the assistant
+        # and contains a question, treat this as an answer that needs context
+        word_count = len(message.split())
+        if not has_pronouns and not has_elliptical and word_count <= 3:
+            # Check if previous message is from assistant and contains a question
+            if conversation_history:
+                last_msg = conversation_history[-1]
+                if last_msg.get('role') == 'assistant':
+                    last_content = last_msg.get('content', '')
+                    # Check if it's a question (contains ?, or contains question phrases)
+                    question_phrases = ['could you', 'can you', 'would you', 'please specify', 'which', 'what', 'where', 'when', 'who', 'how']
+                    is_question = '?' in last_content or any(
+                        q in last_content.lower() for q in question_phrases
+                    )
+                    
+                    if is_question:
+                        logger.info(f"🎯 Detected short answer to AI question: '{message}'")
+                        # Try to resolve by extracting context from the question
+                        return self._resolve_answer_to_question(message, conversation_history)
+        
+        if not has_pronouns and not has_elliptical:
+            logger.info("⏭️ No pronouns or elliptical patterns detected, skipping coreference resolution")
+            return message
+        
+        # If we have elliptical patterns but no pronouns, try to resolve the subject
+        # IMPORTANT: Pass only the conversation history WITHOUT the current message
+        if has_elliptical and not has_pronouns:
+            logger.info(f"🎯 Detected elliptical pattern without pronouns: '{message}'")
+            # conversation_history here is the ORIGINAL history passed to resolve(), 
+            # which does NOT include the current message yet
+            return self._resolve_elliptical_reference(message, conversation_history)
+        
+        # CRITICAL: Special handling for demonstrative pronouns with nouns (e.g., "that folder", "that person", "that place")
+        # Use spaCy to detect ANY demonstrative + noun combination, not just a hardcoded list
+        # This is safe because demonstrative + noun is always referential, never a relative pronoun
+        doc = self.nlp(message)
+        demonstrative_noun_phrases = []
+        
+        for i, token in enumerate(doc):
+            # Check if token is a demonstrative (that/this)
+            if token.lower_ in ['that', 'this'] and token.tag_ == 'DT':
+                # Check if next token is a noun
+                if i + 1 < len(doc):
+                    next_token = doc[i + 1]
+                    if next_token.pos_ in ['NOUN', 'PROPN']:
+                        # Found a demonstrative + noun phrase
+                        phrase = f"{token.text} {next_token.text}"
+                        demonstrative_noun_phrases.append({
+                            'phrase': phrase,
+                            'demonstrative': token.text,
+                            'noun': next_token.text,
+                            'start': token.idx,
+                            'end': next_token.idx + len(next_token.text)
+                        })
+                        logger.info(f"🎯 Detected demonstrative noun phrase: '{phrase}' (noun: {next_token.text}, POS: {next_token.pos_})")
+        
+        # If we found demonstrative + noun phrases, try to resolve them
+        if demonstrative_noun_phrases and conversation_history:
+            # Look at the most recent assistant response
+            last_message = conversation_history[-1]
+            if last_message.get('role') == 'assistant':
+                last_content = last_message.get('content', '')
+                logger.info(f"🔍 Looking for referents in assistant response: {last_content[:200]}...")
+                
+                # FLEXIBLE APPROACH: Use spaCy to extract ALL meaningful noun phrases from the response
+                # This works for ANY scenario: folders, people, places, documents, etc.
+                assistant_doc = self.nlp(last_content)
+                all_candidates = []
+                
+                # Extract named entities (PERSON, ORG, GPE, LOC, PRODUCT, etc.)
+                for ent in assistant_doc.ents:
+                    if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC', 'PRODUCT', 'FAC', 'WORK_OF_ART', 'EVENT']:
+                        all_candidates.append(ent.text)
+                        logger.info(f"✅ Found entity: '{ent.text}' ({ent.label_})")
+                
+                # Extract noun chunks (noun phrases like "bills folder", "the restaurant", etc.)
+                for chunk in assistant_doc.noun_chunks:
+                    # Only include if it's a meaningful noun phrase (not just pronouns or articles)
+                    if chunk.root.pos_ in ['NOUN', 'PROPN']:
+                        # Clean up: remove leading articles/determiners
+                        cleaned = chunk.text
+                        if cleaned.lower().startswith(('the ', 'a ', 'an ')):
+                            cleaned = ' '.join(cleaned.split()[1:])
+                        
+                        if cleaned and len(cleaned) > 1:
+                            all_candidates.append(cleaned)
+                            logger.info(f"✅ Found noun chunk: '{cleaned}'")
+                
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_candidates = []
+                for candidate in all_candidates:
+                    candidate_lower = candidate.lower()
+                    if candidate_lower not in seen:
+                        seen.add(candidate_lower)
+                        unique_candidates.append(candidate)
+                
+                all_candidates = unique_candidates
+                logger.info(f"📊 Total unique candidates: {len(all_candidates)}")
+                
+                if all_candidates:
+                    # FLEXIBLE SELECTION: Use spaCy entity labels to match demonstrative noun with candidates
+                    # E.g., "that person" → prefer PERSON entities
+                    # E.g., "that folder" → prefer candidates that look like paths or were extracted as file/folder entities
+                    first_phrase = demonstrative_noun_phrases[0]
+                    noun_type = first_phrase['noun'].lower()
+                    
+                    # Score each candidate based on how well it matches the noun type
+                    scored_candidates = []
+                    
+                    for candidate in all_candidates:
+                        score = 0
+                        candidate_doc = self.nlp(candidate)
+                        
+                        # Check if candidate has entity labels that match the noun semantically
+                        for ent in candidate_doc.ents:
+                            # PERSON entities for person-related nouns
+                            if ent.label_ == 'PERSON' and any(t.pos_ == 'NOUN' and t.lower_ in self.nlp(noun_type)[0].lower_ for t in candidate_doc):
+                                score += 10
+                            # GPE/LOC/FAC for place-related nouns
+                            elif ent.label_ in ['GPE', 'LOC', 'FAC']:
+                                score += 5
+                            # ORG for organization-related nouns
+                            elif ent.label_ == 'ORG':
+                                score += 5
+                        
+                        # Boost score for paths when noun is file/folder related
+                        if '/' in candidate:
+                            score += 8
+                        
+                        # Boost score for capitalized multi-word phrases (likely proper nouns)
+                        if candidate[0].isupper() and ' ' in candidate:
+                            score += 3
+                        
+                        scored_candidates.append((candidate, score))
+                        logger.debug(f"📊 Candidate '{candidate}' scored {score}")
+                    
+                    # Sort by score (highest first) and pick the best match
+                    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                    referent = scored_candidates[0][0]
+                    logger.info(f"🎯 Selected best match: '{referent}' (score: {scored_candidates[0][1]})")
+                    
+                    # CRITICAL: Append the referent AFTER the noun, don't replace the phrase
+                    # E.g., "that folder" → "that folder bills"
+                    # E.g., "that person" → "that person Bob"
+                    # E.g., "this place" → "this place Paris"
+                    first_phrase = demonstrative_noun_phrases[0]
+                    
+                    # Insert the referent after the demonstrative phrase
+                    resolved = message[:first_phrase['end']] + f' {referent}' + message[first_phrase['end']:]
+                    logger.info(f"✅ Resolved demonstrative: '{message}' → '{resolved}'")
+                    return resolved
+                else:
+                    logger.warning(f"⚠️ No candidates found in assistant response")
+        
+        if not pronouns_to_resolve:
+            return message
+        
+        # CRITICAL: Special case for "this" - check if it appears right after AI response
+        if 'this' in pronouns_to_resolve and conversation_history:
+            last_message = conversation_history[-1]
+            # If last message was from assistant and current message mentions "this"
+            if last_message.get('role') == 'assistant':
+                # Check if this is a request to transform/translate the AI's response
+                transform_patterns = [
+                    r'\b(give me|translate|convert|make|turn|put|write|show me)\s.*\bthis\b',
+                    r'\bthis\s+in\s+(chinese|spanish|french|english|japanese)',
+                    r'\b(summarize|explain|rewrite)\s.*\bthis\b'
+                ]
+                
+                is_transform_request = any(re.search(pattern, message, re.IGNORECASE) for pattern in transform_patterns)
+                
+                if is_transform_request:
+                    logger.info(f"🎯 Detected transform request for AI response: '{message}'")
+                    # Return a special marker that the calling code can recognize
+                    # This tells the system that "this" refers to the previous AI response
+                    resolved = re.sub(r'\bthis\b', 'the previous response', message, flags=re.IGNORECASE)
+                    logger.info(f"🔄 Resolved 'this' to refer to previous AI response: '{resolved}'")
+                    return resolved
+        
+        # CRITICAL: Process current message first to identify nouns we should EXCLUDE
+        current_msg_doc = self.nlp(message)
+        current_msg_nouns = set()
+        current_msg_entities = []  # Track entities from current message
+        
+        for token in current_msg_doc:
+            if token.pos_ in ['NOUN', 'PROPN']:
+                current_msg_nouns.add(token.text.lower())
+        
+        # CRITICAL FIX: Check if pronoun can be resolved within the current message first
+        # E.g., "do I have a bills folder where is it" → "it" refers to "bills folder" in same sentence
+        # BUT: Skip this if screen_content is provided - screen entities should take priority
+        if not screen_content:
+            for ent in current_msg_doc.ents:
+                if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'FAC', 'LOC', 'EVENT']:
+                    current_msg_entities.append(ent.text)
+            
+            # Also extract noun phrases from current message
+            for chunk in current_msg_doc.noun_chunks:
+                # Only include if it's not just a pronoun
+                if chunk.root.pos_ in ['NOUN', 'PROPN']:
+                    current_msg_entities.append(chunk.text)
+            
+            # If we found entities in the current message, prioritize them
+            if current_msg_entities:
+                logger.info(f"🎯 Found {len(current_msg_entities)} potential referents in current message: {current_msg_entities}")
+        else:
+            logger.info(f"🖥️  Screen content provided - skipping current message entity extraction")
+        
+        # Collect named entity candidates from conversation history
+        named_entity_candidates = []
+        noun_candidates = []
+        # Track which candidates came from highlighted text (don't re-process these)
+        highlighted_text_candidates = set()
+        
+        # UI/Button text patterns to exclude (these are not meaningful referents)
+        ui_button_patterns = [
+            'log in', 'sign up', 'log out', 'sign in', 'click here', 'learn more',
+            'get started', 'try free', 'start trial', 'buy now', 'add to cart',
+            'search', 'submit', 'cancel', 'ok', 'yes', 'no', 'close', 'open'
+        ]
+        
+        # CRITICAL: Screen-aware resolution - extract entities from screen content FIRST
+        # These have HIGHEST priority for screen_intelligence intents
+        if screen_content:
+            logger.info(f"🖥️  Extracting entities from screen content for screen-aware resolution")
+            logger.info(f"   Screen content preview: '{screen_content[:200]}...'")
+            
+            screen_doc = self.nlp(screen_content)
+            
+            # Extract entities from screen content
+            for ent in screen_doc.ents:
+                if ent.label_ in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'FAC', 'LOC', 'EVENT']:
+                    named_entity_candidates.append(ent.text)
+                    logger.info(f"✅ Found screen entity: '{ent.text}' ({ent.label_})")
+            
+            # Extract noun chunks (method names, function names, etc.)
+            for chunk in screen_doc.noun_chunks:
+                if chunk.root.pos_ in ['NOUN', 'PROPN']:
+                    # Clean up: remove leading articles/determiners
+                    cleaned = chunk.text
+                    if cleaned.lower().startswith(('the ', 'a ', 'an ')):
+                        cleaned = ' '.join(cleaned.split()[1:])
+                    
+                    if cleaned and len(cleaned) > 1:
+                        named_entity_candidates.append(cleaned)
+                        logger.info(f"✅ Found screen noun chunk: '{cleaned}'")
+            
+            # SPECIAL: Extract method/function names (e.g., "raw()", "repeat()", etc.)
+            # These are common in code documentation and should be prioritized
+            import re
+            method_pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)'
+            methods = re.findall(method_pattern, screen_content)
+            for method in methods:
+                method_with_parens = f"{method}()"
+                named_entity_candidates.append(method_with_parens)
+                logger.info(f"✅ Found screen method: '{method_with_parens}'")
+            
+            logger.info(f"📊 Extracted {len(named_entity_candidates)} candidates from screen content")
+            
+            # If we found candidates from screen, prioritize them and skip conversation history
+            if named_entity_candidates:
+                logger.info(f"🎯 Using screen entities as primary candidates (skipping conversation history)")
+                # Skip conversation history processing - we have screen entities
+            else:
+                logger.info(f"ℹ️ No entities found in screen content, falling back to conversation history.")
+        
+        # Only process conversation history if no screen content was provided or no entities were found in it
+        if not screen_content or not named_entity_candidates:
+            for msg in reversed(conversation_history[-3:]):  # Last 3 messages
+                content = msg['content']
+                
+                # CRITICAL FIX: If this is a wrapped highlighted text message, extract the actual content
+                # E.g., "The highlighted text is: Arfrix Dela Cruz" → "Arfrix Dela Cruz"
+                # E.g., "The highlighted text is: I love Chick Filet" → "Chick Filet"
+                if content.startswith("The highlighted text is:"):
+                    actual_content = content.split(":", 1)[1].strip()
+                    logger.info(f"📎 Extracted highlighted content: '{actual_content}' from wrapped message")
+                    
+                    # Process the highlighted content with spaCy to extract entities
+                    highlighted_doc = self.nlp(actual_content)
+                    
+                    # PRIORITY 1: Extract all consecutive proper nouns (PROPN) - most reliable for names
+                    propn_sequence = []
+                    for token in highlighted_doc:
+                        if token.pos_ == 'PROPN':
+                            propn_sequence.append(token.text)
+                        elif propn_sequence:
+                            # We hit a non-PROPN after collecting some PROPNs, stop here
+                            break
+                    
+                    if propn_sequence:
+                        entity = ' '.join(propn_sequence)
+                        named_entity_candidates.append(entity)
+                        highlighted_text_candidates.add(entity.lower())  # Mark as from highlighted text
+                        logger.info(f"✅ Extracted proper noun sequence from highlighted text: '{entity}'")
+                        continue
+                    
+                    # PRIORITY 2: Try named entity recognition (fallback for when PROPN fails)
+                    highlighted_entities = [ent.text for ent in highlighted_doc.ents 
+                                           if ent.label_ in ['PERSON', 'ORG', 'PRODUCT', 'GPE', 'WORK_OF_ART', 'FAC', 'LOC']]
+                    
+                    if highlighted_entities:
+                        # Use the first entity found
+                        entity = highlighted_entities[0]
+                        named_entity_candidates.append(entity)
+                        logger.info(f"✅ Extracted NER entity from highlighted text: '{entity}'")
+                        continue
+                    
+                    # Last resort: If it's a short phrase (≤4 words) with no verbs, use it as-is
+                    has_verb = any(token.pos_ == 'VERB' for token in highlighted_doc)
+                    word_count = len(actual_content.split())
+                    if not has_verb and word_count <= 4:
+                        named_entity_candidates.append(actual_content)
+                        logger.info(f"✅ Using short highlighted text as entity: '{actual_content}'")
+                        continue
+                    
+                    logger.warning(f"⚠️ Could not extract entity from highlighted text: '{actual_content}'")
+                
+                # Process with spaCy to find entities
+                msg_doc = self.nlp(content)
+            
+                # First priority: Named entities (these are most likely referents)
+                # CRITICAL: Merge adjacent entities that form compound references (e.g., "Genesis 6")
+                entities = list(msg_doc.ents)
+                
+                # DEBUG: Log what spaCy detected
+                logger.info(f"🔍 spaCy detected {len(entities)} entities in: '{msg['content']}'")
+                for ent in entities:
+                    logger.info(f"   - Entity: '{ent.text}' (label: {ent.label_}, start: {ent.start}, end: {ent.end})")
+                
+                merged_entities = []
+                i = 0
+                while i < len(entities):
+                    current_ent = entities[i]
+                    
+                    # Check if next entity is a number that should be merged (e.g., "Genesis" + "6")
+                    if i + 1 < len(entities):
+                        next_ent = entities[i + 1]
+                        # Merge if: current is PROPN/WORK_OF_ART and next is CARDINAL/MONEY/ORDINAL
+                        # AND they're adjacent (no words between them)
+                        if (current_ent.label_ in ['WORK_OF_ART', 'PERSON', 'ORG', 'GPE'] or 
+                            any(t.pos_ == 'PROPN' for t in current_ent)) and \
+                           next_ent.label_ in ['CARDINAL', 'MONEY', 'ORDINAL', 'QUANTITY'] and \
+                           next_ent.start == current_ent.end:
+                            # Merge them
+                            merged_text = f"{current_ent.text} {next_ent.text}"
+                            logger.info(f"🔗 Merging entities: '{current_ent.text}' + '{next_ent.text}' → '{merged_text}'")
+                            merged_entities.append((merged_text, 'MERGED'))
+                            i += 2  # Skip both entities
+                            continue
+                    
+                    merged_entities.append((current_ent.text, current_ent.label_))
+                    i += 1
+                
+                for ent_text, ent_label in merged_entities:
+                    # Include all major entity types that could be pronoun referents
+                    if ent_label in ['PERSON', 'ORG', 'GPE', 'PRODUCT', 'WORK_OF_ART', 'LANGUAGE', 
+                                     'NORP', 'FAC', 'LOC', 'EVENT', 'LAW', 'MERGED']:
+                        # Exclude if this entity appears in current message (likely not a referent)
+                        if ent_text.lower() not in current_msg_nouns:
+                            # CRITICAL: Skip UI button text (e.g., "Log In/Sign Up")
+                            is_ui_button = any(pattern in ent_text.lower() for pattern in ui_button_patterns)
+                            if is_ui_button:
+                                logger.debug(f"⏭️ Skipping UI button text: '{ent_text}'")
+                                continue
+                            
+                            # CRITICAL FIX: Clean verbs from entity text
+                            # If entity is "open Slack", extract only "Slack"
+                            # BUT: Keep PERSON entities intact to preserve full names
+                            if ent_label == 'PERSON':
+                                # Keep full person names as-is (e.g., "Arfrix Dela Cruz")
+                                named_entity_candidates.append(ent_text)
+                                logger.debug(f"👤 Keeping full PERSON entity: '{ent_text}'")
+                            elif ent_label != 'MERGED':  # Don't re-parse merged entities
+                                ent_doc = self.nlp(ent_text)
+                                entity_tokens = [t for t in ent_doc if t.pos_ in ['NOUN', 'PROPN', 'ADJ', 'NUM']]
+                                if entity_tokens:
+                                    cleaned_entity = ' '.join([t.text for t in entity_tokens])
+                                    # Double-check cleaned entity isn't UI text
+                                    if not any(pattern in cleaned_entity.lower() for pattern in ui_button_patterns):
+                                        named_entity_candidates.append(cleaned_entity)
+                                else:
+                                    # Fallback to original if no noun/propn/adj found
+                                    if not is_ui_button:
+                                        named_entity_candidates.append(ent_text)
+                            else:
+                                # Merged entities are already clean
+                                named_entity_candidates.append(ent_text)
+                
+                # Second priority: Proper nouns (NNP) that aren't in current message
+                for token in msg_doc:
+                    if token.tag_ == 'NNP' and token.text.lower() not in current_msg_nouns:
+                        # CRITICAL FIX: Only extract noun/proper noun tokens, NOT verbs
+                        # This prevents capturing "open Slack" instead of just "Slack"
+                        noun_phrase = ' '.join([t.text for t in token.subtree if t.pos_ in ['NOUN', 'PROPN', 'ADJ'] and t.dep_ not in ['aux', 'auxpass', 'cop']])
+                        if noun_phrase and noun_phrase.lower() not in current_msg_nouns:
+                            noun_candidates.append(noun_phrase)
+        
+        # CRITICAL FIX: Prioritize entities from current message over conversation history
+        # This prevents picking up irrelevant entities like "ai mcp services" from file paths
+        if current_msg_entities:
+            # Use current message entities first
+            all_candidates = current_msg_entities
+            logger.info(f"✅ Using {len(all_candidates)} candidates from current message (prioritized)")
+        else:
+            # Fall back to conversation history
+            all_candidates = named_entity_candidates + noun_candidates
+            logger.info(f"⏭️ No candidates in current message, using {len(all_candidates)} from conversation history")
+        
+        if all_candidates:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_candidates = []
+            for c in all_candidates:
+                if c.lower() not in seen:
+                    seen.add(c.lower())
+                    unique_candidates.append(c)
+            
+            # CRITICAL: For screen-related questions, prioritize content entities over UI elements
+            # E.g., "what chapter is this on" should refer to "Genesis 6" not "Log In/Sign Up"
+            screen_question_keywords = ['chapter', 'page', 'section', 'article', 'reading', 'viewing', 'watching']
+            is_screen_question = any(keyword in message.lower() for keyword in screen_question_keywords)
+            
+            if is_screen_question and len(unique_candidates) > 1:
+                # Prioritize candidates that look like content (not UI buttons)
+                content_candidates = []
+                for candidate in unique_candidates:
+                    # Check if this looks like content (has numbers, or is a proper noun phrase)
+                    has_number = any(char.isdigit() for char in candidate)
+                    is_multi_word = len(candidate.split()) > 1
+                    is_ui_like = any(pattern in candidate.lower() for pattern in ui_button_patterns)
+                    
+                    if (has_number or is_multi_word) and not is_ui_like:
+                        content_candidates.append(candidate)
+                        logger.info(f"📄 Prioritizing content candidate: '{candidate}' for screen question")
+                
+                # Use content candidates if found, otherwise fall back to all candidates
+                if content_candidates:
+                    referent = content_candidates[0]
+                    logger.info(f"🎯 Selected content referent: '{referent}' for screen question")
+                else:
+                    referent = unique_candidates[0]
+            else:
+                referent = unique_candidates[0]
+            
+            # CRITICAL FIX: Skip re-processing if this came from highlighted text
+            # Highlighted text has already been properly extracted (e.g., "Arfrix Dela Cruz")
+            if referent.lower() not in highlighted_text_candidates:
+                # CRITICAL FIX: Strip verb prefixes from referent
+                # If referent is "open Slack", we want just "Slack"
+                # BUT: Preserve full entity names (PERSON, ORG, PRODUCT, GPE, etc.)
+                referent_doc = self.nlp(referent)
+                
+                # Check if this contains a named entity - if so, extract ONLY the entity
+                # Priority order: PERSON > ORG > PRODUCT > GPE > WORK_OF_ART > others
+                entity_priority = ['PERSON', 'ORG', 'PRODUCT', 'GPE', 'WORK_OF_ART', 'FAC', 'LOC', 'EVENT', 'NORP']
+                extracted_entity = None
+                
+                for entity_type in entity_priority:
+                    entities = [ent for ent in referent_doc.ents if ent.label_ == entity_type]
+                    if entities:
+                        extracted_entity = entities[0].text
+                        logger.info(f"🏷️ Extracted {entity_type} entity from text: '{extracted_entity}'")
+                        break
+                
+                if extracted_entity:
+                    # E.g., "I love eating at Chick Filet" → "Chick Filet"
+                    # E.g., "doing very well Mark Shultz in life" → "Mark Shultz"
+                    referent = extracted_entity
+                else:
+                    # Common command verbs to strip
+                    command_verbs = {'open', 'close', 'start', 'stop', 'launch', 'quit', 'kill', 'run', 'execute'}
+                    
+                    noun_tokens = []
+                    for token in referent_doc:
+                        # Skip if it's a verb OR if it's in our command verb list
+                        if token.pos_ == 'VERB' or token.lemma_.lower() in command_verbs:
+                            logger.info(f"🚫 Skipping verb/command: '{token.text}' (pos: {token.pos_}, lemma: {token.lemma_})")
+                            continue
+                        # Keep nouns, proper nouns, and adjectives
+                        if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
+                            noun_tokens.append(token.text)
+                    
+                    # If we found noun tokens, use them; otherwise keep original
+                    if noun_tokens:
+                        cleaned_referent = ' '.join(noun_tokens)
+                        if cleaned_referent != referent:
+                            logger.info(f"🧹 Cleaned referent: '{referent}' → '{cleaned_referent}'")
+                            referent = cleaned_referent
+                    else:
+                        logger.warning(f"⚠️ No noun tokens found in referent '{referent}', keeping original")
+                    
+                    # DEBUG: Log what tokens were extracted
+                    logger.info(f"🔍 Extracted noun tokens: {noun_tokens}")
+            else:
+                logger.info(f"✅ Skipping re-processing for highlighted text candidate: '{referent}'")
+            
+            logger.info(f"🎯 Simple fallback found referent: '{referent}' for pronouns: {pronouns_to_resolve}")
+            
+            # Replace pronouns with referent
+            resolved = message
+            for pronoun in pronouns_to_resolve:
+                # Case-insensitive replacement
+                resolved = re.sub(
+                    r'\b' + pronoun + r'\b',
+                    referent,
+                    resolved,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+            
+            return resolved
+        
+        # No referent found
+        logger.debug("⚠️ Simple fallback: No referent found")
+        return message
+    
     def _resolve_elliptical_reference(
         self,
         message: str,

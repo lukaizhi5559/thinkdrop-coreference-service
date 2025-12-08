@@ -1,0 +1,662 @@
+"""
+Conversation Context Tracker
+Maintains semantic understanding of conversation state for better coreference resolution
+"""
+
+import re
+from typing import List, Dict, Optional, Any, Tuple
+from dataclasses import dataclass, field
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Entity:
+    """Represents an entity mentioned in conversation"""
+    text: str
+    entity_type: str  # NOUN, PROPN, ORG, GPE, etc.
+    modifiers: List[str] = field(default_factory=list)  # adjectives, determiners
+    context: str = ""  # Full sentence context
+    turn: int = 0  # Which turn it was mentioned
+    
+    def __str__(self):
+        return f"{' '.join(self.modifiers)} {self.text}".strip()
+
+
+@dataclass
+class TopicState:
+    """Represents the current topic/subject being discussed"""
+    main_subject: str  # e.g., "restaurant", "pizza"
+    subject_type: str  # e.g., "italian", "french"
+    ranking: str = "best"  # "best", "second best", "third best", etc.
+    filters: Dict[str, str] = field(default_factory=dict)  # location, price, etc.
+    turn: int = 0
+    
+    def to_query(self) -> str:
+        """Convert topic state to a natural query"""
+        parts = []
+        
+        # Add ranking
+        if self.ranking:
+            parts.append(self.ranking)
+        
+        # Add subject type
+        if self.subject_type:
+            parts.append(self.subject_type)
+            
+        # Add main subject
+        if self.main_subject:
+            parts.append(self.main_subject)
+        
+        query = " ".join(parts)
+        
+        # Add filters
+        if "location" in self.filters:
+            query += f" in {self.filters['location']}"
+        if "price" in self.filters:
+            query += f" ({self.filters['price']})"
+            
+        return query
+
+
+class ConversationContext:
+    """
+    Tracks conversation state for semantic coreference resolution
+    Uses spaCy for entity extraction and semantic understanding
+    """
+    
+    def __init__(self, nlp):
+        self.nlp = nlp
+        self.current_topic: Optional[TopicState] = None
+        self.entity_history: List[Entity] = []  # Last N entities mentioned
+        self.topic_history: List[TopicState] = []  # Topic progression
+        self.max_entity_history = 10
+        self.max_topic_history = 5
+        
+    def extract_entities(self, doc, turn: int) -> List[Entity]:
+        """Extract meaningful entities from a spaCy doc"""
+        entities = []
+        
+        # Extract named entities (but skip location fragments)
+        # Also track which entities we've seen to avoid duplicates
+        seen_entities = set()
+        
+        for ent in doc.ents:
+            # Skip common location fragments that are often parts of larger names
+            if ent.text in ['York', 'Manhattan', 'Brooklyn', 'Island', 'City']:
+                continue
+                
+            # For GPE/LOC, only keep if it's a complete location (not a fragment)
+            # E.g., keep "New York" but not "York" alone
+            if ent.label_ in ['ORG', 'PERSON', 'PRODUCT']:
+                if ent.text.lower() not in seen_entities:
+                    entities.append(Entity(
+                        text=ent.text,
+                        entity_type=ent.label_,
+                        context=doc.text,
+                        turn=turn
+                    ))
+                    seen_entities.add(ent.text.lower())
+            elif ent.label_ in ['GPE', 'LOC']:
+                # Only add locations if they're multi-word or well-known single words
+                if (len(ent.text.split()) > 1 or ent.text.lower() in ['brooklyn', 'manhattan', 'paris', 'london', 'tokyo']) and ent.text.lower() not in seen_entities:
+                    entities.append(Entity(
+                        text=ent.text,
+                        entity_type=ent.label_,
+                        context=doc.text,
+                        turn=turn
+                    ))
+                    seen_entities.add(ent.text.lower())
+        
+        # Extract noun chunks (subjects) - but be very selective
+        for chunk in doc.noun_chunks:
+            # Skip pronouns, very short chunks, and common words
+            if chunk.root.pos_ in ['NOUN', 'PROPN'] and len(chunk.text) > 2:
+                # Skip if it's a location fragment or already seen
+                if chunk.root.text.lower() in seen_entities:
+                    continue
+                if chunk.root.text in ['York', 'Manhattan', 'Brooklyn', 'Island', 'City']:
+                    continue
+                    
+                # Extract modifiers (adjectives, determiners)
+                modifiers = [token.text for token in chunk if token.pos_ in ['ADJ', 'DET', 'NUM']]
+                
+                # Only add if not a duplicate
+                if chunk.root.text.lower() not in seen_entities:
+                    entities.append(Entity(
+                        text=chunk.root.text,
+                        entity_type=chunk.root.pos_,
+                        modifiers=modifiers,
+                        context=doc.text,
+                        turn=turn
+                    ))
+                    seen_entities.add(chunk.root.text.lower())
+        
+        return entities
+    
+    def extract_ranking(self, text: str) -> Optional[str]:
+        """Extract ranking/ordinal from text (best, second best, etc.)"""
+        # Ordinal + superlative patterns (including "the second cheapest")
+        ordinal_match = re.search(
+            r'\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(best|worst|largest|smallest|biggest|most|least|cheapest|expensive|costliest)',
+            text,
+            re.IGNORECASE
+        )
+        if ordinal_match:
+            return ordinal_match.group(0).lower().replace('the ', '')
+        
+        # Bare ordinal (e.g., "the third" without superlative) - map to "X best"
+        bare_ordinal_match = re.search(
+            r'\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+one)?$',
+            text.strip(),
+            re.IGNORECASE
+        )
+        if bare_ordinal_match:
+            ordinal = bare_ordinal_match.group(1).lower()
+            ordinal_to_ranking = {
+                'first': 'best',
+                'second': 'second best',
+                'third': 'third best',
+                'fourth': 'fourth best',
+                'fifth': 'fifth best',
+                'sixth': 'sixth best',
+                'seventh': 'seventh best',
+                'eighth': 'eighth best',
+                'ninth': 'ninth best',
+                'tenth': 'tenth best',
+            }
+            return ordinal_to_ranking.get(ordinal, f"{ordinal} best")
+        
+        # Just superlative
+        superlative_match = re.search(
+            r'\b(best|worst|largest|smallest|biggest|most|least|cheapest|expensive|costliest)\b',
+            text,
+            re.IGNORECASE
+        )
+        if superlative_match:
+            return superlative_match.group(0).lower()
+        
+        return None
+    
+    def extract_location(self, doc) -> Optional[str]:
+        """Extract location from spaCy doc"""
+        for ent in doc.ents:
+            if ent.label_ in ['GPE', 'LOC']:
+                return ent.text
+        
+        # Check for "in X" pattern
+        for i, token in enumerate(doc):
+            if token.text.lower() == 'in' and i + 1 < len(doc):
+                next_token = doc[i + 1]
+                if next_token.pos_ == 'PROPN':
+                    return next_token.text
+        
+        return None
+    
+    def detect_topic_shift(self, doc, text: str) -> bool:
+        """Detect if this message represents a topic shift"""
+        # Explicit topic shift patterns
+        shift_patterns = [
+            r'\b(what about|how about)\s+',
+            r'\b(going back to|back to|return to)\s+',
+            r'\b(instead|rather)\b',
+        ]
+        
+        for pattern in shift_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        
+        return False
+    
+    def extract_subject_type(self, doc) -> Optional[str]:
+        """Extract subject type (e.g., 'italian', 'french', 'mexican')"""
+        # Look for adjectives that modify nouns (cuisine types, etc.)
+        for chunk in doc.noun_chunks:
+            for token in chunk:
+                if token.pos_ == 'ADJ' and token.dep_ == 'amod':
+                    # Check if it's a cuisine/type adjective
+                    if any(keyword in chunk.root.text.lower() for keyword in ['restaurant', 'food', 'cuisine', 'place']):
+                        return token.text.lower()
+        
+        # Look for proper nouns that might be cuisine types
+        for token in doc:
+            if token.pos_ == 'PROPN' or token.pos_ == 'ADJ':
+                # Common cuisine types
+                if token.text.lower() in ['italian', 'french', 'japanese', 'chinese', 'mexican', 
+                                          'indian', 'thai', 'korean', 'vietnamese', 'spanish']:
+                    return token.text.lower()
+        
+        return None
+    
+    def extract_main_subject(self, doc) -> Optional[str]:
+        """Extract main subject (e.g., 'restaurant', 'pizza', 'cheese cake')"""
+        # Look for meaningful noun chunks (full phrases, not just root)
+        for chunk in doc.noun_chunks:
+            if chunk.root.pos_ in ['NOUN', 'PROPN']:
+                # Skip very generic words and filler phrases
+                if chunk.root.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'info', 'information', 'options', 'more']:
+                    # Get the full noun phrase, excluding determiners at the start
+                    text = chunk.text
+                    if text.lower().startswith(('the ', 'a ', 'an ')):
+                        text = ' '.join(text.split()[1:])
+                    
+                    # Skip common filler phrases
+                    if text.lower() in ['more options', 'more info', 'more information']:
+                        continue
+                    
+                    # Return the full phrase if it's meaningful
+                    if text and len(text) > 1:
+                        return text.lower()
+        
+        # Fallback: look for any NOUN, PROPN, or subject tokens that aren't in noun chunks
+        # This handles cases like "What's the best pizza" where "pizza" isn't in a noun chunk
+        # Also handles cases where spaCy mistagged a noun as ADJ (e.g., "pretzel" in "second best pretzel")
+        for token in doc:
+            # Look for NOUN/PROPN or tokens that are subjects (nsubj, nsubjpass)
+            is_subject = token.dep_ in ['nsubj', 'nsubjpass', 'attr']
+            if token.pos_ in ['NOUN', 'PROPN'] or (is_subject and token.pos_ == 'ADJ'):
+                if token.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'what', 'which', 'best', 'worst', 'options', 'more', 'info', 'information']:
+                    # Check if this is part of a compound noun (e.g., "cheese cake")
+                    compound_parts = [token.text]
+                    # Look backwards for compound modifiers
+                    for child in token.children:
+                        if child.dep_ == 'compound' and child.i < token.i:
+                            compound_parts.insert(0, child.text)
+                    
+                    result = ' '.join(compound_parts).lower()
+                    if result and len(result) > 1 and result not in ['more options', 'more info']:
+                        return result
+        
+        return None
+    
+    def update_from_user_message(self, message: str, turn: int) -> None:
+        """Update context from a user message"""
+        logger.info(f"📝 Updating context from user message (turn {turn}): '{message}'")
+        
+        # Skip filler messages that don't contain meaningful content
+        filler_patterns = [
+            r'^(thanks|thank you|ok|okay|yes|no|sure|great|cool|nice|good|alright)(\s+(for|the|info|information|that))*$',
+            r'^(i need|i want|show me|give me)\s+(more|another)\s+(options?|info|information)$',
+        ]
+        if any(re.match(pattern, message.strip(), re.IGNORECASE) for pattern in filler_patterns):
+            logger.info(f"   ⏭️ Skipping filler message: '{message}'")
+            return
+        
+        doc = self.nlp(message)
+        
+        # Extract entities and add to history
+        entities = self.extract_entities(doc, turn)
+        self.entity_history.extend(entities)
+        self.entity_history = self.entity_history[-self.max_entity_history:]  # Keep last N
+        
+        # Check for topic shift
+        is_topic_shift = self.detect_topic_shift(doc, message)
+        
+        # Extract components
+        ranking = self.extract_ranking(message)
+        location = self.extract_location(doc)
+        subject_type = self.extract_subject_type(doc)
+        main_subject = self.extract_main_subject(doc)
+        
+        logger.info(f"   Extracted - ranking: '{ranking}', location: '{location}', subject_type: '{subject_type}', main_subject: '{main_subject}'")
+        
+        # Update topic state
+        if is_topic_shift or not self.current_topic:
+            # New topic or explicit shift
+            if main_subject or subject_type or ranking:
+                # Create new topic with whatever we have
+                new_topic = TopicState(
+                    main_subject=main_subject or (self.current_topic.main_subject if self.current_topic else ""),
+                    subject_type=subject_type or (self.current_topic.subject_type if self.current_topic else ""),
+                    ranking=ranking or (self.current_topic.ranking if self.current_topic else "best"),
+                    turn=turn
+                )
+                
+                if location:
+                    new_topic.filters["location"] = location
+                
+                # Save old topic to history
+                if self.current_topic:
+                    self.topic_history.append(self.current_topic)
+                    self.topic_history = self.topic_history[-self.max_topic_history:]
+                
+                self.current_topic = new_topic
+                logger.info(f"📍 New topic: {self.current_topic.to_query()}")
+        else:
+            # Update existing topic
+            if self.current_topic:
+                if ranking:
+                    self.current_topic.ranking = ranking
+                if location:
+                    self.current_topic.filters["location"] = location
+                if subject_type:
+                    self.current_topic.subject_type = subject_type
+                if main_subject:
+                    self.current_topic.main_subject = main_subject
+                
+                logger.info(f"🔄 Updated topic: {self.current_topic.to_query()}")
+    
+    def resolve_elliptical(self, message: str) -> Optional[str]:
+        """Resolve elliptical references using current context"""
+        if not self.current_topic:
+            logger.info(f"⚠️ No current topic set, cannot resolve elliptical: '{message}'")
+            return None
+        
+        logger.info(f"🔍 Resolving elliptical with current topic: {self.current_topic.to_query()}")
+        doc = self.nlp(message)
+        
+        # FIRST: Check for "another/next/cheapest option/one/choice" before general "what about X"
+        option_match = re.match(r'^(?:what about|how about|show me)?\s*(?:the\s+)?(another|other|next|last|previous|cheapest)\s+(one|option|choice)$', message.strip(), re.IGNORECASE)
+        if option_match:
+            modifier = option_match.group(1).lower()
+            # Map modifiers to rankings or keep current
+            if modifier == 'cheapest':
+                self.current_topic.ranking = 'cheapest'
+            elif modifier in ['another', 'other', 'next']:
+                # Keep current ranking, just return another instance
+                pass
+            
+            resolved = f"what's {self.current_topic.to_query()}"
+            logger.info(f"✅ Resolved '{modifier} option' (early): '{message}' → '{resolved}'")
+            return resolved
+        
+        # SECOND: Check for bare ordinals like "how about the third" before general "what about X"
+        bare_ordinal_early_match = re.match(r'^(?:how about|what about)\s+(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+one)?$', message.strip(), re.IGNORECASE)
+        if bare_ordinal_early_match:
+            ordinal = bare_ordinal_early_match.group(1).lower()
+            ordinal_to_ranking = {
+                'first': 'best',
+                'second': 'second best',
+                'third': 'third best',
+                'fourth': 'fourth best',
+                'fifth': 'fifth best',
+                'sixth': 'sixth best',
+                'seventh': 'seventh best',
+                'eighth': 'eighth best',
+                'ninth': 'ninth best',
+                'tenth': 'tenth best',
+            }
+            self.current_topic.ranking = ordinal_to_ranking.get(ordinal, f"{ordinal} best")
+            resolved = f"what's {self.current_topic.to_query()}"
+            logger.info(f"✅ Resolved bare ordinal (early): '{message}' → '{resolved}'")
+            return resolved
+        
+        # Check for "going back to X, what about Y" pattern
+        going_back_match = re.search(r'going back to\s+(\w+),\s*what about\s+(.+?)(?:\?|$)', message, re.IGNORECASE)
+        if going_back_match:
+            topic_return = going_back_match.group(1).lower()
+            new_subject = going_back_match.group(2).strip()
+            
+            # Extract location from new_subject if present
+            location_doc = self.nlp(new_subject)
+            location = self.extract_location(location_doc)
+            
+            # Build resolved query
+            resolved = f"what's best {topic_return[:-1] if topic_return.endswith('s') else topic_return}"
+            if location:
+                resolved += f" in {location}"
+            
+            logger.info(f"✅ Resolved 'going back to': '{message}' → '{resolved}'")
+            return resolved
+        
+        # Check for "what about X" topic shift pattern
+        what_about_match = re.search(r'\b(what about|how about)\s+(.+?)(?:\?|$)', message, re.IGNORECASE)
+        if what_about_match:
+            new_subject_text = what_about_match.group(2).strip()
+            
+            # Check if it's just a location (e.g., "what about in Los Angeles")
+            location_only_match = re.match(r'^in\s+(.+)$', new_subject_text, re.IGNORECASE)
+            if location_only_match:
+                # This is just a location refinement, not a topic shift
+                location = location_only_match.group(1).strip()
+                self.current_topic.filters["location"] = location
+                resolved = self.current_topic.to_query()
+                logger.info(f"✅ Resolved location-only 'what about': '{message}' → '{resolved}'")
+                return resolved
+            
+            # Check if it contains a ranking + modifier (e.g., "the best budget option")
+            ranking_modifier_match = re.match(
+                r'^(the\s+)?(best|worst|cheapest|expensive)\s+(\w+)\s+(option|one|choice)$',
+                new_subject_text,
+                re.IGNORECASE
+            )
+            if ranking_modifier_match:
+                ranking = ranking_modifier_match.group(2).lower()
+                modifier = ranking_modifier_match.group(3).lower()
+                # Apply ranking and modifier to current topic
+                self.current_topic.ranking = ranking
+                resolved = f"what's {ranking} {modifier} {self.current_topic.subject_type or ''} {self.current_topic.main_subject}".strip()
+                logger.info(f"✅ Resolved ranking + modifier: '{message}' → '{resolved}'")
+                return resolved
+            
+            # Check if it's an elliptical pattern (e.g., "the second best")
+            is_elliptical_subject = re.match(
+                r'^(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(best|worst|largest|smallest|biggest|most|least)$',
+                new_subject_text,
+                re.IGNORECASE
+            )
+            
+            if not is_elliptical_subject:
+                # This is a topic shift - extract new subject type and/or main subject
+                subject_type = self.extract_subject_type(doc)
+                main_subject = self.extract_main_subject(doc)
+                
+                logger.info(f"🔍 Topic shift detected - subject_type: '{subject_type}', main_subject: '{main_subject}'")
+                
+                # If we have either a subject type or main subject, this is a valid topic shift
+                if subject_type or main_subject:
+                    # Apply current ranking to new subject
+                    resolved = f"what's {self.current_topic.ranking}"
+                    if subject_type:
+                        resolved += f" {subject_type}"
+                    if main_subject and main_subject != subject_type:
+                        # Only add main subject if it's different from subject type
+                        resolved += f" {main_subject}"
+                    elif main_subject and not subject_type:
+                        # No subject type, just use main subject
+                        resolved += f" {main_subject}"
+                    
+                    logger.info(f"✅ Resolved topic shift: '{message}' → '{resolved}'")
+                    return resolved
+                else:
+                    # Fallback: if we can't extract anything, just use the text after "what about"
+                    resolved = f"what's {self.current_topic.ranking} {new_subject_text}"
+                    logger.info(f"✅ Resolved topic shift (fallback): '{message}' → '{resolved}'")
+                    return resolved
+        
+        # Check for location refinement patterns first (e.g., "in Brooklyn though", "in San Francisco though")
+        location_refinement_match = re.match(r'^in\s+(.+?)(?:\s+though)?$', message.strip(), re.IGNORECASE)
+        if location_refinement_match:
+            location = location_refinement_match.group(1).strip()
+            self.current_topic.filters["location"] = location
+            resolved = self.current_topic.to_query()
+            logger.info(f"✅ Resolved location refinement: '{message}' → '{resolved}'")
+            return resolved
+        
+        # Check for other elliptical patterns
+        elliptical_patterns = [
+            r'\b(what\'?s?|which|who\'?s?)\s+(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(best|worst|largest|smallest|biggest|most|least)',
+            r'\b(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(best|worst|largest|smallest|biggest|most|least|cheapest)',
+            r'\b(the\s+)?(next|last|previous|another|other)\s+(one|option|choice)',
+            r'\b(what about|how about)\s+(the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(best|worst|largest|smallest|biggest|most|least)',
+            r'\b(what about|how about)\s+(the\s+)?(next|last|previous|another|other|cheapest)\s+(one|option|choice)',  # "what about the next option"
+            r'\b(how about|what about)\s+(.+?)\s+(specifically|though|again)',  # "how about pizza specifically"
+            r'^(the\s+)?(third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)$',  # Just "the third"
+            r'^(the\s+)?(second|third)\s+(one)$',  # "the second one"
+            r'\b(the\s+)?(best|worst)\s+(one)\s+(there|here)',  # "the best one there"
+            r'^in\s+.+?(?:\s+though)?$',  # "in Brooklyn though" or "in San Francisco though"
+            r'\bshow\s+me\s+(another|other)\s+(one|option)',  # "show me another one"
+            r'going back to\s+\w+',  # "going back to hotels"
+        ]
+        
+        is_elliptical = any(re.search(pattern, message, re.IGNORECASE) for pattern in elliptical_patterns)
+        
+        if not is_elliptical:
+            return None
+        
+        # Special handling for "another option/one/choice"
+        another_match = re.match(r'^(?:what about|how about)\s+(another|other)\s+(one|option|choice)$', message.strip(), re.IGNORECASE)
+        if another_match:
+            # "another" typically means maintaining current ranking
+            resolved = self.current_topic.to_query()
+            resolved = f"what's {resolved}"
+            logger.info(f"✅ Resolved 'another option': '{message}' → '{resolved}'")
+            return resolved
+        
+        # Special handling for "the best/worst one there/here"
+        best_one_there_match = re.match(r'^(?:the\s+)?(best|worst|cheapest)\s+one\s+(there|here)$', message.strip(), re.IGNORECASE)
+        if best_one_there_match:
+            ranking = best_one_there_match.group(1).lower()
+            self.current_topic.ranking = ranking
+            resolved = self.current_topic.to_query()
+            logger.info(f"✅ Resolved 'the {ranking} one there': '{message}' → '{resolved}'")
+            return resolved
+        
+        # Special handling for bare ordinals like "the third" or "the second one"
+        # Also handles "how about the third"
+        bare_ordinal_match = re.match(r'^(?:how about|what about)?\s*(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+one)?$', message.strip(), re.IGNORECASE)
+        if bare_ordinal_match:
+            ordinal = bare_ordinal_match.group(1).lower()
+            # Map ordinal to ranking
+            ordinal_to_ranking = {
+                'first': 'best',
+                'second': 'second best',
+                'third': 'third best',
+                'fourth': 'fourth best',
+                'fifth': 'fifth best',
+                'sixth': 'sixth best',
+                'seventh': 'seventh best',
+                'eighth': 'eighth best',
+                'ninth': 'ninth best',
+                'tenth': 'tenth best',
+            }
+            self.current_topic.ranking = ordinal_to_ranking.get(ordinal, f"{ordinal} best")
+            
+            # Build resolved query with updated ranking
+            resolved = self.current_topic.to_query()
+            
+            # Add question word if present
+            if re.match(r'\b(how about|what about)\b', message, re.IGNORECASE):
+                resolved = f"what's {resolved}"
+            
+            logger.info(f"✅ Resolved bare ordinal: '{message}' → '{resolved}'")
+            return resolved
+        
+        # Extract any new ranking from the message
+        new_ranking = self.extract_ranking(message)
+        if new_ranking:
+            self.current_topic.ranking = new_ranking
+        
+        # Build resolved query
+        resolved = self.current_topic.to_query()
+        
+        # Check if message starts with question word
+        if re.match(r'\b(what\'?s?|which|who\'?s?|how)\b', message, re.IGNORECASE):
+            # Keep the question structure
+            question_word = re.match(r'\b(what\'?s?|which|who\'?s?|how)\b', message, re.IGNORECASE).group(0)
+            resolved = f"{question_word} {resolved}"
+        
+        logger.info(f"✅ Resolved elliptical: '{message}' → '{resolved}'")
+        return resolved
+    
+    def resolve_pronoun(self, message: str, doc) -> Optional[str]:
+        """Resolve pronouns using entity history"""
+        # Check for pronouns
+        pronouns = ['it', 'that', 'this', 'them', 'those', 'these']
+        has_pronoun = any(token.text.lower() in pronouns for token in doc)
+        
+        if not has_pronoun or not self.entity_history:
+            return None
+        
+        # Get the most recent concrete entity (not from current message)
+        # Prioritize PERSON, ORG, PRODUCT over location fragments
+        last_entity = None
+        for entity in reversed(self.entity_history):
+            # Skip location fragments like "York" (from "New York")
+            # Prefer full proper nouns and named entities
+            if entity.entity_type in ['PERSON', 'ORG', 'PRODUCT']:
+                last_entity = entity
+                break
+            elif entity.entity_type == 'PROPN':
+                # For PROPN, prefer multi-word entities or capitalized words
+                if len(entity.text.split()) > 1 or (entity.text[0].isupper() and len(entity.text) > 3):
+                    last_entity = entity
+                    break
+        
+        if not last_entity:
+            # Fallback: use any entity
+            for entity in reversed(self.entity_history):
+                if entity.entity_type in ['ORG', 'PROPN', 'PRODUCT', 'PERSON']:
+                    last_entity = entity
+                    break
+        
+        if not last_entity:
+            return None
+        
+        # Replace pronoun with entity
+        resolved = message
+        for pronoun in pronouns:
+            pattern = r'\b' + pronoun + r'\b'
+            resolved = re.sub(pattern, last_entity.text, resolved, flags=re.IGNORECASE, count=1)
+        
+        if resolved != message:
+            logger.info(f"✅ Resolved pronoun: '{message}' → '{resolved}'")
+            return resolved
+        
+        return None
+    
+    def resolve_short_answer(self, message: str, last_assistant_message: str) -> Optional[str]:
+        """Resolve short answers to AI questions"""
+        # Check if message is short (1-3 words)
+        if len(message.split()) > 3:
+            return None
+        
+        if not self.current_topic:
+            return None
+        
+        # Check if assistant asked a question
+        is_question = '?' in last_assistant_message or any(
+            phrase in last_assistant_message.lower() 
+            for phrase in ['could you', 'would you', 'please specify', 'which', 'what', 'where']
+        )
+        
+        if not is_question:
+            return None
+        
+        # Determine what was asked about
+        doc = self.nlp(last_assistant_message)
+        location = self.extract_location(doc)
+        
+        # Check if asking about location
+        if any(word in last_assistant_message.lower() for word in ['region', 'location', 'place', 'area', 'neighborhood', 'city', 'where']):
+            # Answer is a location
+            self.current_topic.filters["location"] = message
+            resolved = f"{self.current_topic.to_query()}"
+            logger.info(f"✅ Resolved short answer (location): '{message}' → '{resolved}'")
+            return resolved
+        
+        # Check if asking about price/budget
+        if any(word in last_assistant_message.lower() for word in ['budget', 'price', 'cost', 'expensive', 'cheap']):
+            self.current_topic.filters["price"] = message
+            resolved = f"{self.current_topic.to_query()}"
+            logger.info(f"✅ Resolved short answer (price): '{message}' → '{resolved}'")
+            return resolved
+        
+        # Check if asking about style/preference (casual, formal, etc.)
+        if any(word in last_assistant_message.lower() for word in ['casual', 'formal', 'fine dining', 'style', 'preference', 'looking for']):
+            # Answer is a style preference - append to current topic
+            resolved = f"{message} {self.current_topic.to_query()}"
+            logger.info(f"✅ Resolved short answer (style): '{message}' → '{resolved}'")
+            return resolved
+        
+        return None
+    
+    def get_context_summary(self) -> Dict[str, Any]:
+        """Get a summary of current context for debugging"""
+        return {
+            "current_topic": self.current_topic.to_query() if self.current_topic else None,
+            "entity_count": len(self.entity_history),
+            "last_entities": [str(e) for e in self.entity_history[-3:]],
+            "topic_history": [t.to_query() for t in self.topic_history]
+        }
