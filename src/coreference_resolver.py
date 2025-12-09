@@ -69,10 +69,13 @@ class CoreferenceResolver:
         # Reset context
         self.context = ConversationContext(self.nlp)
         
-        # Process each user message to build up context
+        # Process each message to build up context
         for i, msg in enumerate(conversation_history):
             if msg.get('role') == 'user':
                 self.context.update_from_user_message(msg['content'], i)
+            elif msg.get('role') == 'assistant':
+                # Extract entities from AI responses for pronoun resolution
+                self.context.update_from_assistant_message(msg['content'], i)
         
         # Log current context state
         if self.context.current_topic:

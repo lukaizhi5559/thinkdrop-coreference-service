@@ -19,6 +19,8 @@ class Entity:
     modifiers: List[str] = field(default_factory=list)  # adjectives, determiners
     context: str = ""  # Full sentence context
     turn: int = 0  # Which turn it was mentioned
+    position_in_list: Optional[int] = None  # Ordinal position (1st, 2nd, 3rd) when mentioned in a list
+    is_most_recent: bool = False  # Track most recently mentioned entity for "that one" resolution
     
     def __str__(self):
         return f"{' '.join(self.modifiers)} {self.text}".strip()
@@ -71,8 +73,9 @@ class ConversationContext:
         self.current_topic: Optional[TopicState] = None
         self.entity_history: List[Entity] = []  # Last N entities mentioned
         self.topic_history: List[TopicState] = []  # Topic progression
-        self.max_entity_history = 10
+        self.max_entity_history = 40  # Increased to 40 to track "first one" references in long conversations
         self.max_topic_history = 5
+        self.global_entity_position = 0  # Track global position across entire conversation
         
     def extract_entities(self, doc, turn: int) -> List[Entity]:
         """Extract meaningful entities from a spaCy doc"""
@@ -90,22 +93,50 @@ class ConversationContext:
             # For GPE/LOC, only keep if it's a complete location (not a fragment)
             # E.g., keep "New York" but not "York" alone
             if ent.label_ in ['ORG', 'PERSON', 'PRODUCT']:
-                if ent.text.lower() not in seen_entities:
-                    entities.append(Entity(
-                        text=ent.text,
-                        entity_type=ent.label_,
-                        context=doc.text,
-                        turn=turn
-                    ))
-                    seen_entities.add(ent.text.lower())
+                # Split comma-separated entities ONLY for lists (e.g., "Carbone, Lupa, Sodi")
+                # But NOT for single entities with commas (e.g., "New York, NY")
+                entity_parts = [part.strip() for part in ent.text.split(',') if part.strip()]
+                
+                # Only split if we have multiple parts AND they look like a list (not address-like)
+                # Check if parts are short (likely names, not addresses)
+                if len(entity_parts) > 1 and all(len(part.split()) <= 2 for part in entity_parts):
+                    # This looks like a list: "Carbone, Lupa, Sodi"
+                    for entity_text in entity_parts:
+                        if entity_text.lower() not in seen_entities:
+                            self.global_entity_position += 1
+                            entities.append(Entity(
+                                text=entity_text,
+                                entity_type=ent.label_,
+                                context=doc.text,
+                                turn=turn,
+                                position_in_list=self.global_entity_position,
+                                is_most_recent=True
+                            ))
+                            seen_entities.add(entity_text.lower())
+                else:
+                    # Single entity or address-like, keep as-is
+                    if ent.text.lower() not in seen_entities:
+                        self.global_entity_position += 1
+                        entities.append(Entity(
+                            text=ent.text,
+                            entity_type=ent.label_,
+                            context=doc.text,
+                            turn=turn,
+                            position_in_list=self.global_entity_position,
+                            is_most_recent=True
+                        ))
+                        seen_entities.add(ent.text.lower())
             elif ent.label_ in ['GPE', 'LOC']:
                 # Only add locations if they're multi-word or well-known single words
                 if (len(ent.text.split()) > 1 or ent.text.lower() in ['brooklyn', 'manhattan', 'paris', 'london', 'tokyo']) and ent.text.lower() not in seen_entities:
+                    self.global_entity_position += 1
                     entities.append(Entity(
                         text=ent.text,
                         entity_type=ent.label_,
                         context=doc.text,
-                        turn=turn
+                        turn=turn,
+                        position_in_list=self.global_entity_position,
+                        is_most_recent=True
                     ))
                     seen_entities.add(ent.text.lower())
         
@@ -124,12 +155,22 @@ class ConversationContext:
                 
                 # Only add if not a duplicate
                 if chunk.root.text.lower() not in seen_entities:
+                    # Only assign positions to proper nouns (likely entity names), not common nouns
+                    position = None
+                    is_recent = False
+                    if chunk.root.pos_ == 'PROPN':
+                        self.global_entity_position += 1
+                        position = self.global_entity_position
+                        is_recent = True
+                    
                     entities.append(Entity(
                         text=chunk.root.text,
                         entity_type=chunk.root.pos_,
                         modifiers=modifiers,
                         context=doc.text,
-                        turn=turn
+                        turn=turn,
+                        position_in_list=position,
+                        is_most_recent=is_recent
                     ))
                     seen_entities.add(chunk.root.text.lower())
         
@@ -147,13 +188,18 @@ class ConversationContext:
             return ordinal_match.group(0).lower().replace('the ', '')
         
         # Bare ordinal (e.g., "the third" without superlative) - map to "X best"
+        # Also handle common typos like "thrid" → "third"
         bare_ordinal_match = re.search(
-            r'\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+one)?$',
+            r'\b(?:the\s+)?(first|second|third|thrid|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+one)?$',
             text.strip(),
             re.IGNORECASE
         )
         if bare_ordinal_match:
             ordinal = bare_ordinal_match.group(1).lower()
+            # Fix common typos
+            if ordinal == 'thrid':
+                ordinal = 'third'
+            
             ordinal_to_ranking = {
                 'first': 'best',
                 'second': 'second best',
@@ -234,8 +280,9 @@ class ConversationContext:
         # Look for meaningful noun chunks (full phrases, not just root)
         for chunk in doc.noun_chunks:
             if chunk.root.pos_ in ['NOUN', 'PROPN']:
-                # Skip very generic words and filler phrases
-                if chunk.root.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'info', 'information', 'options', 'more']:
+                # Skip very generic words, filler phrases, and ordinal numbers used as subjects
+                if chunk.root.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'info', 'information', 'options', 'more', 
+                                                     'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth']:
                     # Get the full noun phrase, excluding determiners at the start
                     text = chunk.text
                     if text.lower().startswith(('the ', 'a ', 'an ')):
@@ -256,7 +303,8 @@ class ConversationContext:
             # Look for NOUN/PROPN or tokens that are subjects (nsubj, nsubjpass)
             is_subject = token.dep_ in ['nsubj', 'nsubjpass', 'attr']
             if token.pos_ in ['NOUN', 'PROPN'] or (is_subject and token.pos_ == 'ADJ'):
-                if token.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'what', 'which', 'best', 'worst', 'options', 'more', 'info', 'information']:
+                if token.text.lower() not in ['one', 'thing', 'option', 'choice', 'it', 'that', 'this', 'what', 'which', 'best', 'worst', 'options', 'more', 'info', 'information',
+                                               'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth']:
                     # Check if this is part of a compound noun (e.g., "cheese cake")
                     compound_parts = [token.text]
                     # Look backwards for compound modifiers
@@ -287,6 +335,12 @@ class ConversationContext:
         
         # Extract entities and add to history
         entities = self.extract_entities(doc, turn)
+        
+        # Mark all existing entities as not most recent
+        for entity in self.entity_history:
+            entity.is_most_recent = False
+        
+        # Add new entities (they're already marked as most_recent=True)
         self.entity_history.extend(entities)
         self.entity_history = self.entity_history[-self.max_entity_history:]  # Keep last N
         
@@ -337,6 +391,23 @@ class ConversationContext:
                 
                 logger.info(f"🔄 Updated topic: {self.current_topic.to_query()}")
     
+    def update_from_assistant_message(self, message: str, turn: int) -> None:
+        """Extract entities from assistant messages (for pronoun resolution)"""
+        doc = self.nlp(message)
+        
+        # Extract entities from AI response
+        entities = self.extract_entities(doc, turn)
+        
+        # Mark all existing entities as not most recent
+        for entity in self.entity_history:
+            entity.is_most_recent = False
+        
+        # Add new entities from AI message
+        self.entity_history.extend(entities)
+        self.entity_history = self.entity_history[-self.max_entity_history:]
+        
+        logger.info(f"📥 Extracted {len(entities)} entities from assistant message (turn {turn})")
+    
     def resolve_elliptical(self, message: str) -> Optional[str]:
         """Resolve elliptical references using current context"""
         if not self.current_topic:
@@ -346,7 +417,30 @@ class ConversationContext:
         logger.info(f"🔍 Resolving elliptical with current topic: {self.current_topic.to_query()}")
         doc = self.nlp(message)
         
-        # FIRST: Check for "another/next/cheapest option/one/choice" before general "what about X"
+        # FIRST: Check for "And X" continuation patterns (e.g., "And Paris?", "And what about Tokyo?")
+        and_continuation = re.match(r'^and\s+(.+?)(?:\?|$)', message.strip(), re.IGNORECASE)
+        if and_continuation:
+            continuation_text = and_continuation.group(1).strip()
+            
+            # Check if it's a simple entity continuation (e.g., "And Paris?")
+            simple_entity = re.match(r'^([A-Z]\w+)$', continuation_text)
+            if simple_entity:
+                # This is likely a location or entity continuation
+                entity_name = simple_entity.group(1)
+                resolved = f"{self.current_topic.main_subject} {entity_name}"
+                logger.info(f"✅ Resolved 'And X' continuation: '{message}' → '{resolved}'")
+                return resolved
+            
+            # Check if it's "And what about X"
+            and_what_about = re.match(r'^what about\s+(.+)$', continuation_text, re.IGNORECASE)
+            if and_what_about:
+                new_subject = and_what_about.group(1).strip()
+                # Apply same logic as regular "what about" but preserve ranking
+                resolved = f"{self.current_topic.main_subject} {new_subject}"
+                logger.info(f"✅ Resolved 'And what about X': '{message}' → '{resolved}'")
+                return resolved
+        
+        # SECOND: Check for "another/next/cheapest option/one/choice" before general "what about X"
         option_match = re.match(r'^(?:what about|how about|show me)?\s*(?:the\s+)?(another|other|next|last|previous|cheapest)\s+(one|option|choice)$', message.strip(), re.IGNORECASE)
         if option_match:
             modifier = option_match.group(1).lower()
@@ -400,10 +494,30 @@ class ConversationContext:
             logger.info(f"✅ Resolved 'going back to': '{message}' → '{resolved}'")
             return resolved
         
+        # Check for temporal shifts: "tomorrow", "yesterday", "next week", etc.
+        temporal_match = re.search(r'\b(tomorrow|yesterday|tonight|today|next\s+\w+|last\s+\w+|this\s+\w+)\b', message, re.IGNORECASE)
+        if temporal_match:
+            temporal_modifier = temporal_match.group(1).lower()
+            
+            # Check if this is a simple temporal shift (e.g., "what about tomorrow")
+            simple_temporal = re.match(r'^(what about|how about)\s+(tomorrow|yesterday|tonight|today|next\s+\w+|last\s+\w+|this\s+\w+)$', message.strip(), re.IGNORECASE)
+            if simple_temporal:
+                # Preserve current topic and add temporal modifier
+                resolved = f"{self.current_topic.main_subject} {temporal_modifier}"
+                logger.info(f"✅ Resolved temporal shift: '{message}' → '{resolved}'")
+                return resolved
+        
         # Check for "what about X" topic shift pattern
         what_about_match = re.search(r'\b(what about|how about)\s+(.+?)(?:\?|$)', message, re.IGNORECASE)
         if what_about_match:
             new_subject_text = what_about_match.group(2).strip()
+            
+            # Check if it's a temporal modifier (e.g., "what about tomorrow")
+            if re.match(r'^(tomorrow|yesterday|tonight|today|next\s+\w+|last\s+\w+|this\s+\w+)$', new_subject_text, re.IGNORECASE):
+                # Preserve current topic and add temporal modifier
+                resolved = f"{self.current_topic.main_subject} {new_subject_text}"
+                logger.info(f"✅ Resolved temporal 'what about': '{message}' → '{resolved}'")
+                return resolved
             
             # Check if it's just a location (e.g., "what about in Los Angeles")
             location_only_match = re.match(r'^in\s+(.+)$', new_subject_text, re.IGNORECASE)
@@ -438,6 +552,30 @@ class ConversationContext:
             )
             
             if not is_elliptical_subject:
+                # Check if current topic is a question pattern (e.g., "what time", "what color", "how much")
+                is_question_pattern = self.current_topic.main_subject and any(
+                    self.current_topic.main_subject.startswith(q) 
+                    for q in ['what ', 'how ', 'when ', 'where ', 'why ', 'which ']
+                )
+                
+                # Check if new subject is just a location (proper noun)
+                new_subject_doc = self.nlp(new_subject_text)
+                is_location_shift = any(ent.label_ == 'GPE' for ent in new_subject_doc.ents)
+                
+                if is_question_pattern and is_location_shift:
+                    # Preserve the question pattern and just update location
+                    # e.g., "What time is it in France" + "what about brazil" → "What time is it in Brazil"
+                    location = new_subject_text
+                    self.current_topic.filters["location"] = location
+                    
+                    # Reconstruct the question with new location
+                    resolved = f"{self.current_topic.main_subject}"
+                    if location:
+                        resolved += f" in {location}"
+                    
+                    logger.info(f"✅ Resolved question + location shift: '{message}' → '{resolved}'")
+                    return resolved
+                
                 # This is a topic shift - extract new subject type and/or main subject
                 subject_type = self.extract_subject_type(doc)
                 main_subject = self.extract_main_subject(doc)
@@ -562,46 +700,87 @@ class ConversationContext:
     
     def resolve_pronoun(self, message: str, doc) -> Optional[str]:
         """Resolve pronouns using entity history"""
-        # Check for pronouns
+        # Check for pronouns and demonstratives
         pronouns = ['it', 'that', 'this', 'them', 'those', 'these']
         has_pronoun = any(token.text.lower() in pronouns for token in doc)
         
-        if not has_pronoun or not self.entity_history:
+        # Special handling for "that one", "this one", "the first one"
+        message_lower = message.lower()
+        that_one_match = re.search(r'\b(that|this)\s+one\b', message_lower)
+        ordinal_match = re.search(r'\bthe\s+(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+one\b', message_lower)
+        
+        if not (has_pronoun or that_one_match or ordinal_match) or not self.entity_history:
             return None
         
-        # Get the most recent concrete entity (not from current message)
-        # Prioritize PERSON, ORG, PRODUCT over location fragments
-        last_entity = None
-        for entity in reversed(self.entity_history):
-            # Skip location fragments like "York" (from "New York")
-            # Prefer full proper nouns and named entities
-            if entity.entity_type in ['PERSON', 'ORG', 'PRODUCT']:
-                last_entity = entity
-                break
-            elif entity.entity_type == 'PROPN':
-                # For PROPN, prefer multi-word entities or capitalized words
-                if len(entity.text.split()) > 1 or (entity.text[0].isupper() and len(entity.text) > 3):
-                    last_entity = entity
-                    break
+        resolved = message  # Start with original message
         
-        if not last_entity:
-            # Fallback: use any entity
+        # Handle ordinal references FIRST: "the first one", "the second one"
+        if ordinal_match:
+            ordinal_text = ordinal_match.group(1)
+            ordinal_map = {
+                'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+                'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10
+            }
+            target_position = ordinal_map.get(ordinal_text)
+            
+            logger.info(f"🔍 Looking for entity at position {target_position}")
+            logger.info(f"📋 Entity history: {[(e.text, e.position_in_list) for e in self.entity_history]}")
+            
+            if target_position:
+                # Find entity at that position
+                for entity in self.entity_history:
+                    if entity.position_in_list == target_position:
+                        resolved = re.sub(r'\bthe\s+(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+one\b', 
+                                        entity.text, resolved, flags=re.IGNORECASE, count=1)
+                        logger.info(f"✅ Resolved ordinal reference: 'the {ordinal_text} one' → '{entity.text}'")
+                        break
+                else:
+                    logger.info(f"⚠️ No entity found at position {target_position}")
+        
+        # Handle "that one" / "this one" - use most recent entity
+        if that_one_match and resolved == message:  # Only if not already resolved
             for entity in reversed(self.entity_history):
-                if entity.entity_type in ['ORG', 'PROPN', 'PRODUCT', 'PERSON']:
-                    last_entity = entity
+                if entity.is_most_recent:
+                    resolved = re.sub(r'\b(that|this)\s+one\b', entity.text, resolved, flags=re.IGNORECASE, count=1)
+                    logger.info(f"✅ Resolved 'that/this one' → '{entity.text}'")
                     break
         
-        if not last_entity:
-            return None
+        # Handle regular pronouns (it, that, this, etc.)
+        if has_pronoun:
+            # Get the most recent concrete entity
+            # NOW INCLUDES PERSON entities for "it" (users often say "it" for people)
+            last_entity = None
+            for entity in reversed(self.entity_history):
+                # Prioritize PERSON, ORG, PRODUCT entities
+                if entity.entity_type in ['PERSON', 'ORG', 'PRODUCT']:
+                    last_entity = entity
+                    break
+                elif entity.entity_type == 'PROPN':
+                    # For PROPN, prefer multi-word entities or capitalized words
+                    if len(entity.text.split()) > 1 or (entity.text[0].isupper() and len(entity.text) > 3):
+                        last_entity = entity
+                        break
+            
+            if not last_entity:
+                # Fallback: use any entity
+                for entity in reversed(self.entity_history):
+                    if entity.entity_type in ['ORG', 'PROPN', 'PRODUCT', 'PERSON']:
+                        last_entity = entity
+                        break
+            
+            if last_entity:
+                # Replace pronoun with entity
+                for pronoun in pronouns:
+                    pattern = r'\b' + pronoun + r'\b'
+                    new_resolved = re.sub(pattern, last_entity.text, resolved, flags=re.IGNORECASE, count=1)
+                    if new_resolved != resolved:
+                        logger.info(f"✅ Resolved pronoun '{pronoun}' → '{last_entity.text}'")
+                        resolved = new_resolved
+                        break
         
-        # Replace pronoun with entity
-        resolved = message
-        for pronoun in pronouns:
-            pattern = r'\b' + pronoun + r'\b'
-            resolved = re.sub(pattern, last_entity.text, resolved, flags=re.IGNORECASE, count=1)
-        
+        # Return resolved message if anything changed
         if resolved != message:
-            logger.info(f"✅ Resolved pronoun: '{message}' → '{resolved}'")
+            logger.info(f"✅ Final resolved: '{message}' → '{resolved}'")
             return resolved
         
         return None
