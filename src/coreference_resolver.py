@@ -141,6 +141,20 @@ class CoreferenceResolver:
             # Process with spaCy
             doc = self.nlp(full_text)
             
+            # EARLY CHECK: Skip resolution for imperative commands
+            # Check if the message is a standalone imperative command that doesn't need context
+            early_needs_check = self._check_needs_context(message, [], "none")
+            if not early_needs_check:
+                # This is a standalone command - return it unchanged
+                logger.info(f"⏭️  Skipping resolution for standalone imperative command: '{message}'")
+                return {
+                    "originalMessage": message,
+                    "resolvedMessage": message,
+                    "replacements": [],
+                    "method": "none",
+                    "needsContext": False
+                }
+            
             # Get resolved text based on available method
             if self.coref_method == 'coreferee':
                 # coreferee analyzes full context but we only resolve current message
@@ -1028,12 +1042,72 @@ class CoreferenceResolver:
                 logger.info(f"✅ needsContext=True: Detected elliptical pattern '{pattern}' in message")
                 return True
         
-        # 3. Very short queries (< 5 words) are often follow-ups
+        # 3. Check for imperative commands (action verbs) - these are standalone
+        # Common action verbs that indicate complete commands
+        action_verbs = [
+            'open', 'close', 'start', 'stop', 'launch', 'quit', 'exit',
+            'search', 'find', 'look', 'show', 'display', 'hide',
+            'create', 'make', 'build', 'delete', 'remove',
+            'go', 'navigate', 'visit', 'browse',
+            'play', 'pause', 'resume', 'skip',
+            'send', 'email', 'message', 'call',
+            'save', 'export', 'download', 'upload',
+            'copy', 'paste', 'cut', 'move',
+            'click', 'type', 'press', 'select'
+        ]
+        
+        # Check if message starts with an action verb OR contains action verb after polite prefix
+        words = message.lower().split()
+        first_word = words[0] if words else ''
+        
+        # Check for elliptical patterns that use action verbs but still need context
+        # e.g., "show me the first one", "find the second one", "open the next one"
+        elliptical_with_verbs = [
+            r'\b(show|find|get|give)\s+me\s+(the\s+)?(first|second|third|next|last|previous|another|other)\b',
+            r'\b(open|show|display)\s+(the\s+)?(first|second|third|next|last|previous|another|other)\b',
+        ]
+        
+        for pattern in elliptical_with_verbs:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"✅ needsContext=True: Detected elliptical pattern with action verb: '{pattern}'")
+                return True
+        
+        # Direct imperative: "open google"
+        if first_word in action_verbs:
+            # Check if it has a concrete target (not just ordinals/pronouns)
+            if len(words) >= 2:
+                second_word = words[1]
+                # If second word is ordinal/pronoun, it needs context
+                if second_word in ['the', 'it', 'that', 'this', 'first', 'second', 'third', 'next', 'last']:
+                    logger.info(f"✅ needsContext=True: Action verb '{first_word}' followed by reference word '{second_word}'")
+                    return True
+            
+            logger.info(f"❌ needsContext=False: Detected imperative command starting with '{first_word}'")
+            return False
+        
+        # Polite imperative: "please open google", "can you open google", "I need you to open google"
+        if len(words) >= 2:
+            # Check if any action verb appears in the first 5 words (after polite prefix)
+            for i, word in enumerate(words[:5]):
+                if word in action_verbs:
+                    # Check if there's a concrete target after the verb (not ordinal/pronoun)
+                    if i < len(words) - 1:
+                        next_word = words[i + 1]
+                        # If next word is ordinal/pronoun, it needs context
+                        if next_word in ['the', 'it', 'that', 'this', 'first', 'second', 'third', 'next', 'last']:
+                            logger.info(f"✅ needsContext=True: Action verb '{word}' followed by reference word '{next_word}'")
+                            return True
+                        
+                        logger.info(f"❌ needsContext=False: Detected imperative command with action verb '{word}' at position {i}")
+                        return False
+                    break
+        
+        # 4. Very short queries (< 5 words) are often follow-ups
         word_count = len(message.split())
         if word_count < 5:
             logger.info(f"✅ needsContext=True: Short query ({word_count} words)")
             return True
         
-        # 4. No indicators found - query is likely standalone
+        # 5. No indicators found - query is likely standalone
         logger.info(f"❌ needsContext=False: No context indicators found")
         return False
